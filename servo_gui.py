@@ -7,6 +7,10 @@ Fashion Star 总线伺服舵机 - iOS风格现代化GUI界面
 
 import sys
 import time
+import sys
+import os
+import json
+import struct
 import serial
 import serial.tools.list_ports
 from typing import List, Dict, Optional
@@ -15,15 +19,43 @@ from PyQt6.QtWidgets import (
     QGridLayout, QLabel, QComboBox, QPushButton, QTableWidget,
     QTableWidgetItem, QHeaderView, QGroupBox, QSplitter,
     QStatusBar, QProgressBar, QFrame, QScrollArea, QTabWidget,
-    QDoubleSpinBox, QSpinBox
+    QDoubleSpinBox, QSpinBox, QSlider, QTextEdit, QFileDialog,
+    QDialog, QFormLayout, QDialogButtonBox, QListWidget,
+    QListWidgetItem, QCheckBox
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
-from PyQt6.QtGui import QFont, QColor, QPalette, QIcon, QPainter, QBrush, QPen
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QMimeData
+from PyQt6.QtGui import QFont, QColor, QPalette, QIcon, QPainter, QBrush, QPen, QDrag
 
 try:
     import fashionstar_uart_sdk as uservo
 except ImportError:
-    print("警告: fashionstar_uart_sdk 未安装")
+    uservo = None
+    print("提示: fashionstar_uart_sdk 未安装，部分功能不可用")
+
+
+class DragDropListWidget(QListWidget):
+    """支持拖拽重新排序的列表控件"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setDragDropMode(QListWidget.DragDropMode.InternalMove)
+        self.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.setDragEnabled(True)
+        self.setAcceptDrops(True)
+        self.setDropIndicatorShown(True)
+        self.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
+        self.parent_gui = None
+    
+    def set_parent_gui(self, gui):
+        self.parent_gui = gui
+    
+    def dropEvent(self, event):
+        """拖放完成后更新行号"""
+        super().dropEvent(event)
+        # 获取当前选中的行并更新父GUI的行号选择器
+        current_row = self.currentRow()
+        if current_row >= 0 and self.parent_gui:
+            self.parent_gui.row_select_spin.setValue(current_row + 1)
+            self.parent_gui.status_bar.showMessage(f"已重新排序，当前第 {current_row + 1} 行")
 
 
 class ServoScannerThread(QThread):
@@ -191,6 +223,19 @@ class ServoControlGUI(QMainWindow):
         self.monitoring = False
         self.scanner_thread = None
         self.info_thread = None
+        self.servo_sliders = {}  # 存储舵机ID到滑块的映射
+        self.servo_offsets = {}  # 存储舵机ID到零偏的映射
+        self.offset_file = "servo_offsets.json"  # 零偏文件路径
+        self.last_servo_data = {}  # 保存最近一次刷新的舵机数据
+        self.slider_data = {}  # 存储每个舵机的拖动状态和定时器
+        self.servo_speed = 1000  # 默认速度
+        
+        # 顺序执行相关
+        self.sequence_commands = []
+        self.sequence_running = False
+        self.current_command_index = 0
+        self.waiting_timer = None
+        self.loop_count = 0
         
         self.init_ui()
         self.refresh_ports()
@@ -223,6 +268,10 @@ class ServoControlGUI(QMainWindow):
         # 标签页2: 控制
         control_tab = self.create_control_tab()
         self.right_tab_widget.addTab(control_tab, "控制")
+        
+        # 标签页3: 同步控制
+        sync_control_tab = self.create_sync_control_tab()
+        self.right_tab_widget.addTab(sync_control_tab, "同步控制")
         
         main_layout.addWidget(self.right_tab_widget)
         
@@ -459,9 +508,9 @@ class ServoControlGUI(QMainWindow):
         btn_layout = QHBoxLayout()
         btn_layout.setSpacing(10)
         
-        refresh_btn = QPushButton("刷新")
-        refresh_btn.setFixedHeight(40)
-        refresh_btn.setStyleSheet("""
+        self.refresh_btn = QPushButton("刷新")
+        self.refresh_btn.setFixedHeight(40)
+        self.refresh_btn.setStyleSheet("""
             QPushButton {
                 background-color: rgba(0, 122, 255, 0.1);
                 color: #007AFF;
@@ -473,9 +522,13 @@ class ServoControlGUI(QMainWindow):
             QPushButton:hover {
                 background-color: rgba(0, 122, 255, 0.18);
             }
+            QPushButton:disabled {
+                background-color: rgba(0, 0, 0, 0.1);
+                color: rgba(0, 0, 0, 0.3);
+            }
         """)
-        refresh_btn.clicked.connect(self.refresh_ports)
-        btn_layout.addWidget(refresh_btn)
+        self.refresh_btn.clicked.connect(self.refresh_ports)
+        btn_layout.addWidget(self.refresh_btn)
         
         self.connect_btn = QPushButton("连接")
         self.connect_btn.setFixedHeight(40)
@@ -673,6 +726,485 @@ class ServoControlGUI(QMainWindow):
         
         return tab
 
+    def create_sync_control_tab(self):
+        """创建同步控制标签页（左右布局）"""
+        tab = QWidget()
+        
+        main_layout = QHBoxLayout(tab)
+        main_layout.setContentsMargins(24, 24, 24, 24)
+        main_layout.setSpacing(20)
+        
+        # ================== 左边：同步控制 ==================
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(20)
+        
+        # 速度设置
+        speed_layout = QHBoxLayout()
+        speed_label = QLabel("速度:")
+        speed_label.setStyleSheet("color: rgb(134, 134, 139); font-size: 14px; font-weight: 600;")
+        speed_layout.addWidget(speed_label)
+        
+        self.servo_speed_spin = QSpinBox()
+        self.servo_speed_spin.setRange(1, 10000)
+        self.servo_speed_spin.setValue(1000)
+        self.servo_speed_spin.setSuffix(" dps")
+        self.servo_speed_spin.setStyleSheet("""
+            QSpinBox {
+                background-color: rgba(0, 122, 255, 0.1);
+                color: rgb(28, 28, 30);
+                border: 2px solid transparent;
+                border-radius: 8px;
+                padding: 6px 10px;
+                font-size: 14px;
+                font-weight: 500;
+                min-width: 120px;
+            }
+            QSpinBox:hover {
+                border: 2px solid rgba(0, 122, 255, 0.3);
+            }
+            QSpinBox:focus {
+                border: 2px solid #007AFF;
+            }
+        """)
+        self.servo_speed_spin.valueChanged.connect(self.on_speed_changed)
+        speed_layout.addWidget(self.servo_speed_spin)
+        speed_layout.addStretch()
+        
+        # 选择要修改的行
+        row_layout = QHBoxLayout()
+        row_label = QLabel("修改行:")
+        row_label.setStyleSheet("color: rgb(134, 134, 139); font-size: 14px; font-weight: 600;")
+        row_layout.addWidget(row_label)
+        
+        self.row_select_spin = QSpinBox()
+        self.row_select_spin.setRange(1, 999)
+        self.row_select_spin.setValue(1)
+        self.row_select_spin.setStyleSheet("""
+            QSpinBox {
+                background-color: rgba(0, 122, 255, 0.1);
+                color: rgb(28, 28, 30);
+                border: 2px solid transparent;
+                border-radius: 8px;
+                padding: 6px 10px;
+                font-size: 14px;
+                font-weight: 500;
+                min-width: 80px;
+            }
+            QSpinBox:hover {
+                border: 2px solid rgba(0, 122, 255, 0.3);
+            }
+            QSpinBox:focus {
+                border: 2px solid #007AFF;
+            }
+        """)
+        row_layout.addWidget(self.row_select_spin)
+        row_layout.addStretch()
+        
+        # 控制按钮
+        btn_layout = QHBoxLayout()
+        
+        # 归零按钮
+        self.reset_all_btn = QPushButton("全部归零")
+        self.reset_all_btn.setFixedHeight(36)
+        self.reset_all_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #FF9500;
+                color: white;
+                border: none;
+                border-radius: 8px;
+                padding: 0 20px;
+                font-weight: 600;
+                font-size: 14px;
+            }
+            QPushButton:hover {
+                background-color: #FFB340;
+            }
+            QPushButton:pressed {
+                background-color: #E08600;
+            }
+            QPushButton:disabled {
+                background-color: #C7C7CC;
+                color: white;
+            }
+        """)
+        self.reset_all_btn.clicked.connect(self.reset_all_servos)
+        self.reset_all_btn.setEnabled(False)
+        btn_layout.addWidget(self.reset_all_btn)
+        
+        # 保存零偏按钮
+        self.save_offset_btn = QPushButton("保存零偏")
+        self.save_offset_btn.setFixedHeight(36)
+        self.save_offset_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #5856D6;
+                color: white;
+                border: none;
+                border-radius: 8px;
+                padding: 0 20px;
+                font-weight: 600;
+                font-size: 14px;
+            }
+            QPushButton:hover {
+                background-color: #7B79E8;
+            }
+            QPushButton:pressed {
+                background-color: #4A48B8;
+            }
+            QPushButton:disabled {
+                background-color: #C7C7CC;
+                color: white;
+            }
+        """)
+        self.save_offset_btn.clicked.connect(self.save_offsets)
+        self.save_offset_btn.setEnabled(False)
+        btn_layout.addWidget(self.save_offset_btn)
+        
+        # 加载零偏按钮
+        self.load_offset_btn = QPushButton("加载零偏")
+        self.load_offset_btn.setFixedHeight(36)
+        self.load_offset_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #AF52DE;
+                color: white;
+                border: none;
+                border-radius: 8px;
+                padding: 0 20px;
+                font-weight: 600;
+                font-size: 14px;
+            }
+            QPushButton:hover {
+                background-color: #C77AED;
+            }
+            QPushButton:pressed {
+                background-color: #9B46C6;
+            }
+            QPushButton:disabled {
+                background-color: #C7C7CC;
+                color: white;
+            }
+        """)
+        self.load_offset_btn.clicked.connect(self.load_offsets)
+        self.load_offset_btn.setEnabled(False)
+        btn_layout.addWidget(self.load_offset_btn)
+        
+        # 添加到顺序执行按钮
+        self.add_to_sequence_btn = QPushButton("添加到顺序")
+        self.add_to_sequence_btn.setFixedHeight(36)
+        self.add_to_sequence_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #007AFF;
+                color: white;
+                border: none;
+                border-radius: 8px;
+                padding: 0 20px;
+                font-weight: 600;
+                font-size: 14px;
+            }
+            QPushButton:hover {
+                background-color: #5AC8FA;
+            }
+            QPushButton:pressed {
+                background-color: #0056CC;
+            }
+            QPushButton:disabled {
+                background-color: #C7C7CC;
+                color: white;
+            }
+        """)
+        self.add_to_sequence_btn.clicked.connect(self.add_to_sequence)
+        self.add_to_sequence_btn.setEnabled(False)
+        btn_layout.addWidget(self.add_to_sequence_btn)
+        
+        # 修改选中行按钮
+        self.update_row_btn = QPushButton("修改选中行")
+        self.update_row_btn.setFixedHeight(36)
+        self.update_row_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #FF6B35;
+                color: white;
+                border: none;
+                border-radius: 8px;
+                padding: 0 20px;
+                font-weight: 600;
+                font-size: 14px;
+            }
+            QPushButton:hover {
+                background-color: #FF8A5C;
+            }
+            QPushButton:pressed {
+                background-color: #E05A2B;
+            }
+            QPushButton:disabled {
+                background-color: #C7C7CC;
+                color: white;
+            }
+        """)
+        self.update_row_btn.clicked.connect(self.update_sequence_row)
+        self.update_row_btn.setEnabled(False)
+        btn_layout.addWidget(self.update_row_btn)
+        
+        left_layout.addLayout(speed_layout)
+        left_layout.addLayout(row_layout)
+        left_layout.addLayout(btn_layout)
+        
+        # 滚动区域用于容纳所有舵机控制
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setStyleSheet("background-color: transparent;")
+        
+        self.sync_control_container = QWidget()
+        self.sync_control_layout = QVBoxLayout(self.sync_control_container)
+        self.sync_control_layout.setSpacing(16)
+        self.sync_control_layout.addStretch()
+        
+        scroll.setWidget(self.sync_control_container)
+        left_layout.addWidget(scroll)
+        
+        # 分隔线
+        divider = QFrame()
+        divider.setFrameShape(QFrame.Shape.VLine)
+        divider.setStyleSheet("background-color: rgba(0, 0, 0, 0.1);")
+        
+        # ================== 右边：顺序执行 ==================
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(20)
+        
+        # 右边标题和说明
+        right_title_layout = QHBoxLayout()
+        right_title = QLabel("顺序执行")
+        right_title.setStyleSheet("color: rgb(28, 28, 30); font-size: 18px; font-weight: 700;")
+        right_title_layout.addWidget(right_title)
+        right_title_layout.addStretch()
+        
+        help_label = QLabel("格式: ID1=20,ID2=30,ID3=-20,ID4=-30,runTime=1s,wait=2s")
+        help_label.setStyleSheet("color: rgb(134, 134, 139); font-size: 12px;")
+        right_title_layout.addWidget(help_label)
+        
+        # 循环执行复选框
+        self.loop_checkbox = QCheckBox("循环执行")
+        self.loop_checkbox.setStyleSheet("""
+            QCheckBox {
+                color: rgb(28, 28, 30);
+                font-size: 13px;
+                font-weight: 500;
+                spacing: 8px;
+            }
+            QCheckBox::indicator {
+                width: 20px;
+                height: 20px;
+                border: 2px solid rgba(0, 122, 255, 0.3);
+                border-radius: 4px;
+                background-color: white;
+            }
+            QCheckBox::indicator:checked {
+                background-color: #007AFF;
+                border: 2px solid #007AFF;
+            }
+        """)
+        right_title_layout.addWidget(self.loop_checkbox)
+        
+        # 指令输入区域（使用可拖拽列表控件）
+        self.sequence_list = DragDropListWidget()
+        self.sequence_list.set_parent_gui(self)
+        self.sequence_list.setStyleSheet("""
+            QListWidget {
+                background-color: white;
+                border: 2px solid rgba(0, 122, 255, 0.2);
+                border-radius: 12px;
+                padding: 8px;
+                font-family: Consolas, Monaco, monospace;
+                font-size: 13px;
+                outline: none;
+            }
+            QListWidget:focus {
+                border: 2px solid #007AFF;
+            }
+            QListWidget::item {
+                padding: 6px 8px;
+                border-radius: 6px;
+            }
+            QListWidget::item:selected {
+                background-color: rgba(0, 122, 255, 0.2);
+                color: rgb(28, 28, 30);
+            }
+            QListWidget::item:hover {
+                background-color: rgba(0, 122, 255, 0.1);
+            }
+        """)
+        self.sequence_list.itemClicked.connect(self.on_sequence_item_clicked)
+        
+        # 控制按钮
+        seq_btn_layout = QHBoxLayout()
+        
+        # 保存文件按钮
+        self.save_seq_btn = QPushButton("保存文件")
+        self.save_seq_btn.setFixedHeight(36)
+        self.save_seq_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #5856D6;
+                color: white;
+                border: none;
+                border-radius: 8px;
+                padding: 0 20px;
+                font-weight: 600;
+                font-size: 14px;
+            }
+            QPushButton:hover {
+                background-color: #7B79E8;
+            }
+            QPushButton:pressed {
+                background-color: #4A48B8;
+            }
+        """)
+        self.save_seq_btn.clicked.connect(self.save_sequence_file)
+        seq_btn_layout.addWidget(self.save_seq_btn)
+        
+        # 读取文件按钮
+        self.load_seq_btn = QPushButton("读取文件")
+        self.load_seq_btn.setFixedHeight(36)
+        self.load_seq_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #007AFF;
+                color: white;
+                border: none;
+                border-radius: 8px;
+                padding: 0 20px;
+                font-weight: 600;
+                font-size: 14px;
+            }
+            QPushButton:hover {
+                background-color: #5AC8FA;
+            }
+            QPushButton:pressed {
+                background-color: #0056CC;
+            }
+        """)
+        self.load_seq_btn.clicked.connect(self.load_sequence_file)
+        seq_btn_layout.addWidget(self.load_seq_btn)
+        
+        # 删除选中行按钮
+        self.delete_seq_btn = QPushButton("删除选中")
+        self.delete_seq_btn.setFixedHeight(36)
+        self.delete_seq_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #FF9500;
+                color: white;
+                border: none;
+                border-radius: 8px;
+                padding: 0 20px;
+                font-weight: 600;
+                font-size: 14px;
+            }
+            QPushButton:hover {
+                background-color: #FFB340;
+            }
+            QPushButton:pressed {
+                background-color: #E08600;
+            }
+        """)
+        self.delete_seq_btn.clicked.connect(self.delete_sequence_row)
+        seq_btn_layout.addWidget(self.delete_seq_btn)
+        
+        # 清空按钮
+        self.clear_seq_btn = QPushButton("清空")
+        self.clear_seq_btn.setFixedHeight(36)
+        self.clear_seq_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #FF3B30;
+                color: white;
+                border: none;
+                border-radius: 8px;
+                padding: 0 20px;
+                font-weight: 600;
+                font-size: 14px;
+            }
+            QPushButton:hover {
+                background-color: #FF453A;
+            }
+            QPushButton:pressed {
+                background-color: #D63027;
+            }
+        """)
+        self.clear_seq_btn.clicked.connect(self.clear_sequence)
+        seq_btn_layout.addWidget(self.clear_seq_btn)
+        
+        self.run_sequence_btn = QPushButton("开始执行")
+        self.run_sequence_btn.setFixedHeight(36)
+        self.run_sequence_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #34C759;
+                color: white;
+                border: none;
+                border-radius: 8px;
+                padding: 0 20px;
+                font-weight: 600;
+                font-size: 14px;
+            }
+            QPushButton:hover {
+                background-color: #4CD964;
+            }
+            QPushButton:pressed {
+                background-color: #28A745;
+            }
+            QPushButton:disabled {
+                background-color: #C7C7CC;
+                color: white;
+            }
+        """)
+        self.run_sequence_btn.clicked.connect(self.run_sequence)
+        self.run_sequence_btn.setEnabled(False)
+        seq_btn_layout.addWidget(self.run_sequence_btn)
+        
+        self.stop_sequence_btn = QPushButton("停止执行")
+        self.stop_sequence_btn.setFixedHeight(36)
+        self.stop_sequence_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #FF3B30;
+                color: white;
+                border: none;
+                border-radius: 8px;
+                padding: 0 20px;
+                font-weight: 600;
+                font-size: 14px;
+            }
+            QPushButton:hover {
+                background-color: #FF453A;
+            }
+            QPushButton:pressed {
+                background-color: #D63027;
+            }
+            QPushButton:disabled {
+                background-color: #C7C7CC;
+                color: white;
+            }
+        """)
+        self.stop_sequence_btn.clicked.connect(self.stop_sequence)
+        self.stop_sequence_btn.setEnabled(False)
+        seq_btn_layout.addWidget(self.stop_sequence_btn)
+        
+        seq_btn_layout.addStretch()
+        
+        # 进度显示
+        self.sequence_progress = QLabel("就绪")
+        self.sequence_progress.setStyleSheet("color: rgb(134, 134, 139); font-size: 13px; font-weight: 500;")
+        seq_btn_layout.addWidget(self.sequence_progress)
+        
+        right_layout.addLayout(right_title_layout)
+        right_layout.addWidget(self.sequence_list)
+        right_layout.addLayout(seq_btn_layout)
+        
+        # 添加到主布局
+        main_layout.addWidget(left_widget, stretch=1)
+        main_layout.addWidget(divider)
+        main_layout.addWidget(right_widget, stretch=1)
+        
+        return tab
+
     def refresh_ports(self):
         self.port_combo.clear()
         ports = serial.tools.list_ports.comports()
@@ -710,6 +1242,7 @@ class ServoControlGUI(QMainWindow):
             # 禁用串口和波特率选择，启用扫描按钮
             self.port_combo.setEnabled(False)
             self.baud_combo.setEnabled(False)
+            self.refresh_btn.setEnabled(False)
             self.scan_btn.setEnabled(True)
             
             self.connect_btn.setText("断开")
@@ -740,21 +1273,33 @@ class ServoControlGUI(QMainWindow):
         if self.uart and self.uart.is_open:
             self.uart.close()
         
+        # 停止所有拖动条定时器
+        for data in self.slider_data.values():
+            if data['timer']:
+                data['timer'].stop()
+        self.slider_data.clear()
+        
         self.servo_manager = None
         self.connected = False
         self.found_servos = []
+        self.last_servo_data = {}
         self.stop_monitoring()
+        self.clear_sync_controls()
         
         # 重新启用串口和波特率选择，禁用控制功能
         self.port_combo.setEnabled(True)
         self.baud_combo.setEnabled(True)
+        self.refresh_btn.setEnabled(True)
         self.scan_btn.setEnabled(False)
         self.servo_select_combo.clear()
         self.servo_select_combo.setEnabled(False)
         self.target_angle_spin.setEnabled(False)
         self.set_angle_btn.setEnabled(False)
-        self.damping_power_spin.setEnabled(False)
-        self.set_damping_btn.setEnabled(False)
+        self.reset_all_btn.setEnabled(False)
+        self.save_offset_btn.setEnabled(False)
+        self.load_offset_btn.setEnabled(False)
+        self.run_sequence_btn.setEnabled(False)
+        self.stop_sequence_btn.setEnabled(False)
         
         self.connect_btn.setText("连接")
         self.connect_btn.setStyleSheet("""
@@ -819,6 +1364,223 @@ class ServoControlGUI(QMainWindow):
         item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
         self.table.setItem(row, 0, item)
 
+    def create_servo_slider(self, servo_id):
+        """为指定舵机创建滑块控件"""
+        card = QWidget()
+        card.setStyleSheet("""
+            QWidget {
+                background-color: white;
+                border-radius: 12px;
+            }
+        """)
+        
+        layout = QHBoxLayout(card)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(16)
+        
+        # 舵机ID标签
+        id_label = QLabel(f"舵机 {servo_id}")
+        id_label.setStyleSheet("color: rgb(28, 28, 30); font-size: 16px; font-weight: 700; min-width: 70px;")
+        layout.addWidget(id_label)
+        
+        # 滑块
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setRange(-180, 180)
+        slider.setValue(0)
+        slider.setStyleSheet("""
+            QSlider::groove:horizontal {
+                height: 8px;
+                background: rgba(0, 122, 255, 0.1);
+                border-radius: 4px;
+            }
+            QSlider::handle:horizontal {
+                width: 24px;
+                height: 24px;
+                background: #007AFF;
+                border-radius: 12px;
+                margin: -8px 0;
+            }
+            QSlider::handle:horizontal:hover {
+                background: #5AC8FA;
+            }
+        """)
+        layout.addWidget(slider)
+        
+        # 角度显示标签
+        angle_label = QLabel("0°")
+        angle_label.setStyleSheet("color: rgb(0, 122, 255); font-size: 16px; font-weight: 700; min-width: 60px;")
+        angle_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        layout.addWidget(angle_label)
+        
+        # 连接信号
+        slider.sliderPressed.connect(lambda: self.on_slider_pressed(servo_id, angle_label))
+        slider.sliderReleased.connect(lambda: self.on_slider_released(servo_id))
+        slider.valueChanged.connect(lambda value: self.on_slider_value_changed(servo_id, value, angle_label))
+        
+        return card, slider
+
+    def on_speed_changed(self, value):
+        """速度设置变化时更新"""
+        self.servo_speed = value
+
+    def on_slider_pressed(self, servo_id, angle_label):
+        """滑块按下时开始定时发送"""
+        slider = self.servo_sliders[servo_id]
+        current_value = slider.value()
+        
+        self.slider_data[servo_id] = {
+            'timer': QTimer(),
+            'current_value': current_value,
+            'release_count': 0,
+            'is_dragging': True,
+            'angle_label': angle_label
+        }
+        
+        data = self.slider_data[servo_id]
+        data['timer'].timeout.connect(lambda: self.send_servo_command(servo_id))
+        data['timer'].start(100)
+        
+        # 立即发送一次
+        self.send_servo_command(servo_id)
+
+    def on_slider_value_changed(self, servo_id, value, angle_label):
+        """滑块值变化时更新显示和记录"""
+        angle_label.setText(f"{value}°")
+        if servo_id in self.slider_data:
+            self.slider_data[servo_id]['current_value'] = value
+
+    def on_slider_released(self, servo_id):
+        """滑块松开时标记状态"""
+        if servo_id in self.slider_data:
+            self.slider_data[servo_id]['is_dragging'] = False
+            self.slider_data[servo_id]['release_count'] = 0
+
+    def send_servo_command(self, servo_id):
+        """发送舵机命令"""
+        if servo_id not in self.slider_data:
+            return
+        
+        data = self.slider_data[servo_id]
+        
+        if self.connected and self.servo_manager:
+            try:
+                # 零偏角度 + 拖动条数值
+                offset = self.servo_offsets.get(servo_id, 0.0)
+                target_angle = offset + data['current_value']
+                self.servo_manager.set_servo_angle(servo_id, target_angle, is_mturn=True, velocity=self.servo_speed)
+            except Exception as e:
+                pass
+        
+        # 处理松开后的发送逻辑
+        if not data['is_dragging']:
+            data['release_count'] += 1
+            if data['release_count'] >= 3:
+                # 发送3次后停止
+                data['timer'].stop()
+                del self.slider_data[servo_id]
+
+    def reset_all_servos(self):
+        """将所有舵机归零（回到零偏角度）"""
+        if not self.connected or not self.servo_manager:
+            return
+        
+        # 先停止所有正在进行的拖动
+        for data in self.slider_data.values():
+            if data['timer']:
+                data['timer'].stop()
+        self.slider_data.clear()
+        
+        # 将所有滑块设为0，并发送命令
+        for servo_id, slider in self.servo_sliders.items():
+            slider.setValue(0)
+            # 直接发送归零命令
+            try:
+                offset = self.servo_offsets.get(servo_id, 0.0)
+                target_angle = offset  # 滑块值为0时 = 零偏角度
+                self.servo_manager.set_servo_angle(servo_id, target_angle, is_mturn=True, velocity=self.servo_speed)
+            except Exception as e:
+                pass
+        
+        self.status_bar.showMessage("所有舵机已归零")
+
+    def load_offsets(self):
+        """从文件读取零偏"""
+        if os.path.exists(self.offset_file):
+            try:
+                # 检查文件是否为空
+                if os.path.getsize(self.offset_file) == 0:
+                    self.servo_offsets = {}
+                    self.status_bar.showMessage("零偏文件为空")
+                    return
+                
+                with open(self.offset_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                
+                # 验证数据格式
+                if not isinstance(data, dict):
+                    self.servo_offsets = {}
+                    self.status_bar.showMessage("零偏文件格式错误")
+                    return
+                
+                # 将键转换为整数
+                self.servo_offsets = {}
+                for k, v in data.items():
+                    try:
+                        servo_id = int(k)
+                        self.servo_offsets[servo_id] = float(v)
+                    except (ValueError, TypeError):
+                        continue
+                
+                self.status_bar.showMessage(f"已加载零偏文件: {len(self.servo_offsets)} 个舵机")
+            except json.JSONDecodeError:
+                self.status_bar.showMessage("零偏文件格式损坏")
+                self.servo_offsets = {}
+            except Exception as e:
+                self.status_bar.showMessage(f"加载零偏失败: {str(e)}")
+                self.servo_offsets = {}
+        else:
+            self.servo_offsets = {}
+            self.status_bar.showMessage("零偏文件不存在")
+
+    def save_offsets(self):
+        """保存当前角度为零偏（使用表格显示的数据）"""
+        if not self.connected or not self.servo_manager:
+            self.status_bar.showMessage("请先连接串口")
+            return
+        
+        try:
+            # 使用最近一次刷新时表格显示的角度作为零偏
+            for servo_id in self.found_servos:
+                if servo_id in self.last_servo_data:
+                    info = self.last_servo_data[servo_id]
+                    angle = info['angle']
+                    if angle is not None:
+                        self.servo_offsets[servo_id] = angle
+                        print(f"舵机 {servo_id} 保存角度: {angle}")
+            
+            # 保存到文件
+            with open(self.offset_file, 'w', encoding='utf-8') as f:
+                json.dump(self.servo_offsets, f, ensure_ascii=False, indent=2)
+            
+            print(f"保存的零偏数据: {self.servo_offsets}")
+            self.status_bar.showMessage(f"已保存零偏: {len(self.servo_offsets)} 个舵机")
+        except Exception as e:
+            self.status_bar.showMessage(f"保存零偏失败: {str(e)}")
+
+    def clear_sync_controls(self):
+        """清空同步控制区域的所有控件"""
+        # 停止所有定时器
+        for data in self.slider_data.values():
+            if data['timer']:
+                data['timer'].stop()
+        self.slider_data.clear()
+        # 移除所有控件（除了最后一个stretch）
+        while self.sync_control_layout.count() > 1:
+            item = self.sync_control_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self.servo_sliders.clear()
+
     def on_scan_finished(self, found):
         self.progress_bar.setVisible(False)
         self.scan_btn.setEnabled(True)
@@ -829,11 +1591,25 @@ class ServoControlGUI(QMainWindow):
         for servo_id in self.found_servos:
             self.servo_select_combo.addItem(f"舵机 {servo_id}", servo_id)
         
+        # 创建同步控制滑块
+        self.clear_sync_controls()
+        for servo_id in self.found_servos:
+            card, slider = self.create_servo_slider(servo_id)
+            # 在stretch之前插入
+            self.sync_control_layout.insertWidget(self.sync_control_layout.count() - 1, card)
+            self.servo_sliders[servo_id] = slider
+        
         if found:
             # 启用控制功能
             self.servo_select_combo.setEnabled(True)
             self.target_angle_spin.setEnabled(True)
             self.set_angle_btn.setEnabled(True)
+            self.reset_all_btn.setEnabled(True)
+            self.save_offset_btn.setEnabled(True)
+            self.load_offset_btn.setEnabled(True)
+            self.add_to_sequence_btn.setEnabled(True)
+            self.update_row_btn.setEnabled(True)
+            self.run_sequence_btn.setEnabled(True)
             
             self.refresh_servo_info()
             QTimer.singleShot(500, lambda: self.start_monitoring() if len(found) > 0 else None)
@@ -857,6 +1633,7 @@ class ServoControlGUI(QMainWindow):
 
     def on_all_info_ready(self, all_info):
         # 一次性更新所有舵机信息
+        self.last_servo_data = all_info  # 保存最近一次的数据
         for row in range(self.table.rowCount()):
             item = self.table.item(row, 0)
             if item:
@@ -930,8 +1707,538 @@ class ServoControlGUI(QMainWindow):
         except Exception as e:
             self.status_bar.showMessage(f"设置阻尼失败: {str(e)}")
 
+    def parse_sequence_line(self, line):
+        """解析一条顺序执行指令"""
+        line = line.strip()
+        if not line:
+            return None
+        
+        parts = line.split(',')
+        servo_data = {}
+        run_time = 1.0
+        wait_time = 0.0
+        
+        for part in parts:
+            part = part.strip()
+            if not part:
+                continue
+            
+            if '=' in part:
+                key, value = part.split('=', 1)
+                key = key.strip()
+                value = value.strip()
+                
+                if key.startswith('ID'):
+                    try:
+                        servo_id = int(key[2:])
+                        angle = float(value)
+                        servo_data[servo_id] = angle
+                    except ValueError:
+                        continue
+                elif key == 'runTime':
+                    try:
+                        run_time = float(value.replace('s', ''))
+                    except ValueError:
+                        run_time = 1.0
+                elif key == 'wait':
+                    try:
+                        wait_time = float(value.replace('s', ''))
+                    except ValueError:
+                        wait_time = 0.0
+        
+        if not servo_data:
+            return None
+        
+        return {
+            'servo_data': servo_data,
+            'run_time': max(0.1, run_time),
+            'wait_time': max(0.1, wait_time)
+        }
+    
+    def on_sequence_item_clicked(self, item):
+        """点击列表项时的处理 - 同步拖动条并控制舵机"""
+        row = self.sequence_list.row(item) + 1
+        self.row_select_spin.setValue(row)
+        
+        # 解析当前行的指令
+        line_text = item.text()
+        cmd = self.parse_sequence_line(line_text)
+        
+        if cmd and 'servo_data' in cmd:
+            # 同步每个舵机的拖动条并发送控制指令
+            for servo_id, offset_value in cmd['servo_data'].items():
+                if servo_id in self.servo_sliders:
+                    self.servo_sliders[servo_id].setValue(int(offset_value))
+                
+                # 发送控制指令到舵机
+                if self.connected and self.servo_manager:
+                    zero_offset = self.servo_offsets.get(servo_id, 0.0)
+                    target_angle = zero_offset + offset_value
+                    try:
+                        self.servo_manager.set_servo_angle(
+                            servo_id,
+                            target_angle,
+                            is_mturn=True,
+                            velocity=self.servo_speed_spin.value()
+                        )
+                    except Exception as e:
+                        print(f"控制舵机 {servo_id} 失败: {e}")
+        
+        self.status_bar.showMessage(f"已选择第 {row} 行")
+    
+    def run_sequence(self):
+        """开始执行顺序指令"""
+        if not self.connected or not self.servo_manager:
+            self.status_bar.showMessage("请先连接串口")
+            return
+        
+        # 先停止所有正在进行的拖动
+        for data in self.slider_data.values():
+            if data['timer']:
+                data['timer'].stop()
+        self.slider_data.clear()
+        
+        # 解析指令
+        self.sequence_commands = []
+        for i in range(self.sequence_list.count()):
+            line = self.sequence_list.item(i).text()
+            cmd = self.parse_sequence_line(line)
+            if cmd:
+                self.sequence_commands.append(cmd)
+        
+        if not self.sequence_commands:
+            self.status_bar.showMessage("没有有效的指令")
+            return
+        
+        # 初始化执行状态
+        self.sequence_running = True
+        self.current_command_index = 0
+        self.loop_count = 0
+        self.waiting_timer = QTimer()
+        self.waiting_timer.setSingleShot(True)
+        self.waiting_timer.timeout.connect(self.execute_next_command)
+        
+        # 更新UI状态 - 只禁用编辑按钮，不禁用整个标签页
+        self.run_sequence_btn.setEnabled(False)
+        self.stop_sequence_btn.setEnabled(True)
+        self.add_to_sequence_btn.setEnabled(False)
+        self.update_row_btn.setEnabled(False)
+        self.delete_seq_btn.setEnabled(False)
+        self.clear_seq_btn.setEnabled(False)
+        self.save_seq_btn.setEnabled(False)
+        self.load_seq_btn.setEnabled(False)
+        
+        # 开始执行
+        self.execute_next_command()
+    
+    def execute_next_command(self):
+        """执行下一条指令"""
+        if not self.sequence_running:
+            self.sequence_finished()
+            return
+        
+        # 检查是否执行完一轮且需要循环
+        if self.current_command_index >= len(self.sequence_commands):
+            if self.loop_checkbox.isChecked():
+                # 循环模式：重置索引，增加循环计数
+                self.current_command_index = 0
+                self.loop_count += 1
+            else:
+                # 非循环模式：结束
+                self.sequence_finished()
+                return
+        
+        cmd = self.sequence_commands[self.current_command_index]
+        
+        # 更新进度显示
+        if self.loop_checkbox.isChecked():
+            self.sequence_progress.setText(
+                f"执行中: 第{self.loop_count + 1}轮 {self.current_command_index + 1}/{len(self.sequence_commands)}"
+            )
+        else:
+            self.sequence_progress.setText(
+                f"执行中: {self.current_command_index + 1}/{len(self.sequence_commands)}"
+            )
+        self.sequence_progress.setStyleSheet("color: #007AFF; font-size: 13px; font-weight: 600;")
+        
+        # 准备同步指令数据
+        command_data_list = []
+        t_acc = 100  # 启动加速时间 (ms)
+        t_dec = 100  # 运动减速时间 (ms)
+        power = 10000  # 功率 (mW)
+        
+        for servo_id, offset_angle in cmd['servo_data'].items():
+            zero_offset = self.servo_offsets.get(servo_id, 0.0)
+            target_angle = zero_offset + offset_angle
+            interval = int(cmd['run_time'] * 1000)
+            
+            # 使用 struct.pack 打包数据，格式: '<BlLHHH'
+            packed_data = struct.pack(
+                '<BlLHHH',
+                servo_id,
+                int(target_angle * 10),  # 角度需要放大10倍
+                interval,
+                t_acc,
+                t_dec,
+                power
+            )
+            command_data_list.append(packed_data)
+        
+        # 发送同步指令
+        try:
+            self.servo_manager.send_sync_multiturnanglebyinterval(
+                command_id=14,
+                servo_num=len(command_data_list),
+                command_data_list=command_data_list
+            )
+        except Exception as e:
+            print(f"发送同步指令失败: {e}")
+        
+        # 更新滑块位置（如果有）
+        for servo_id, offset_angle in cmd['servo_data'].items():
+            if servo_id in self.servo_sliders:
+                self.servo_sliders[servo_id].setValue(int(offset_angle))
+        
+        # 等待 run_time + wait_time
+        total_wait = int((cmd['run_time'] + cmd['wait_time']) * 1000)
+        self.current_command_index += 1
+        self.waiting_timer.start(total_wait)
+    
+    def stop_sequence(self):
+        """停止顺序执行"""
+        self.sequence_running = False
+        if self.waiting_timer:
+            self.waiting_timer.stop()
+        self.sequence_finished()
+    
+    def sequence_finished(self):
+        """顺序执行完成"""
+        self.run_sequence_btn.setEnabled(True)
+        self.stop_sequence_btn.setEnabled(False)
+        self.add_to_sequence_btn.setEnabled(True)
+        self.update_row_btn.setEnabled(True)
+        self.delete_seq_btn.setEnabled(True)
+        self.clear_seq_btn.setEnabled(True)
+        self.save_seq_btn.setEnabled(True)
+        self.load_seq_btn.setEnabled(True)
+        
+        if not self.sequence_running:
+            self.sequence_progress.setText("已停止")
+            self.sequence_progress.setStyleSheet("color: #FF3B30; font-size: 13px; font-weight: 600;")
+            self.status_bar.showMessage("顺序执行已停止")
+        else:
+            self.sequence_progress.setText("完成")
+            self.sequence_progress.setStyleSheet("color: #34C759; font-size: 13px; font-weight: 600;")
+            self.status_bar.showMessage("顺序执行完成")
+    
+    def add_to_sequence(self):
+        """将当前滑块数据添加到顺序执行"""
+        if not self.found_servos:
+            return
+        
+        # 弹出对话框输入 runTime 和 wait
+        dialog = QDialog(self)
+        dialog.setWindowTitle("添加到顺序执行")
+        dialog.setMinimumWidth(300)
+        dialog.setStyleSheet("""
+            QDialog {
+                background-color: rgb(242, 242, 247);
+            }
+            QLabel {
+                color: rgb(28, 28, 30);
+                font-size: 14px;
+                font-weight: 500;
+            }
+            QDoubleSpinBox {
+                background-color: white;
+                border: 2px solid rgba(0, 122, 255, 0.2);
+                border-radius: 8px;
+                padding: 8px 12px;
+                font-size: 14px;
+            }
+            QDoubleSpinBox:focus {
+                border: 2px solid #007AFF;
+            }
+        """)
+        
+        layout = QFormLayout(dialog)
+        layout.setSpacing(16)
+        layout.setContentsMargins(24, 24, 24, 24)
+        
+        run_time_spin = QDoubleSpinBox()
+        run_time_spin.setRange(0.1, 999.0)
+        run_time_spin.setValue(1.0)
+        run_time_spin.setSingleStep(0.1)
+        run_time_spin.setDecimals(1)
+        run_time_spin.setSuffix(" s")
+        
+        wait_spin = QDoubleSpinBox()
+        wait_spin.setRange(0.1, 999.0)
+        wait_spin.setValue(1.0)
+        wait_spin.setSingleStep(0.1)
+        wait_spin.setDecimals(1)
+        wait_spin.setSuffix(" s")
+        
+        layout.addRow("运行时间:", run_time_spin)
+        layout.addRow("等待时间:", wait_spin)
+        
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("确定")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        buttons.setStyleSheet("""
+            QPushButton {
+                background-color: #007AFF;
+                color: white;
+                border: none;
+                border-radius: 8px;
+                padding: 8px 24px;
+                font-weight: 600;
+                font-size: 14px;
+                min-width: 80px;
+            }
+            QPushButton:hover {
+                background-color: #5AC8FA;
+            }
+            QPushButton:pressed {
+                background-color: #0056CC;
+            }
+            QPushButton[text="取消"] {
+                background-color: #8E8E93;
+            }
+            QPushButton[text="取消"]:hover {
+                background-color: #AEAEB2;
+            }
+        """)
+        
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addRow(buttons)
+        
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        
+        # 构建指令字符串
+        parts = []
+        for servo_id in sorted(self.found_servos):
+            if servo_id in self.servo_sliders:
+                value = self.servo_sliders[servo_id].value()
+                parts.append(f"ID{servo_id}={value}")
+        
+        parts.append(f"runTime={run_time_spin.value()}s")
+        parts.append(f"wait={wait_spin.value()}s")
+        
+        cmd_str = ",".join(parts)
+        
+        # 添加到列表
+        self.sequence_list.addItem(cmd_str)
+        
+        # 选中新添加的行
+        new_row = self.sequence_list.count()
+        self.sequence_list.setCurrentRow(new_row - 1)
+        self.row_select_spin.setValue(new_row)
+        
+        self.status_bar.showMessage("已添加到顺序执行")
+    
+    def update_sequence_row(self):
+        """修改顺序执行中指定的行"""
+        if not self.found_servos:
+            return
+        
+        row_num = self.row_select_spin.value()
+        
+        # 检查行号是否有效
+        if row_num < 1 or row_num > self.sequence_list.count():
+            self.status_bar.showMessage(f"行号 {row_num} 无效")
+            return
+        
+        # 从要修改的行中解析 runTime 和 wait
+        old_line = self.sequence_list.item(row_num - 1).text()
+        old_cmd = self.parse_sequence_line(old_line)
+        default_run_time = 1.0
+        default_wait = 1.0
+        if old_cmd:
+            default_run_time = old_cmd['run_time']
+            default_wait = old_cmd['wait_time']
+        
+        # 弹出对话框输入 runTime 和 wait
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"修改第 {row_num} 行")
+        dialog.setMinimumWidth(300)
+        dialog.setStyleSheet("""
+            QDialog {
+                background-color: rgb(242, 242, 247);
+            }
+            QLabel {
+                color: rgb(28, 28, 30);
+                font-size: 14px;
+                font-weight: 500;
+            }
+            QDoubleSpinBox {
+                background-color: white;
+                border: 2px solid rgba(0, 122, 255, 0.2);
+                border-radius: 8px;
+                padding: 8px 12px;
+                font-size: 14px;
+            }
+            QDoubleSpinBox:focus {
+                border: 2px solid #007AFF;
+            }
+        """)
+        
+        layout = QFormLayout(dialog)
+        layout.setSpacing(16)
+        layout.setContentsMargins(24, 24, 24, 24)
+        
+        run_time_spin = QDoubleSpinBox()
+        run_time_spin.setRange(0.1, 999.0)
+        run_time_spin.setValue(default_run_time)
+        run_time_spin.setSingleStep(0.1)
+        run_time_spin.setDecimals(1)
+        run_time_spin.setSuffix(" s")
+        
+        wait_spin = QDoubleSpinBox()
+        wait_spin.setRange(0.1, 999.0)
+        wait_spin.setValue(default_wait)
+        wait_spin.setSingleStep(0.1)
+        wait_spin.setDecimals(1)
+        wait_spin.setSuffix(" s")
+        
+        layout.addRow("运行时间:", run_time_spin)
+        layout.addRow("等待时间:", wait_spin)
+        
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("确定")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        buttons.setStyleSheet("""
+            QPushButton {
+                background-color: #007AFF;
+                color: white;
+                border: none;
+                border-radius: 8px;
+                padding: 8px 24px;
+                font-weight: 600;
+                font-size: 14px;
+                min-width: 80px;
+            }
+            QPushButton:hover {
+                background-color: #5AC8FA;
+            }
+            QPushButton:pressed {
+                background-color: #0056CC;
+            }
+            QPushButton[text="取消"] {
+                background-color: #8E8E93;
+            }
+            QPushButton[text="取消"]:hover {
+                background-color: #AEAEB2;
+            }
+        """)
+        
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addRow(buttons)
+        
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        
+        # 构建新的指令字符串
+        parts = []
+        for servo_id in sorted(self.found_servos):
+            if servo_id in self.servo_sliders:
+                value = self.servo_sliders[servo_id].value()
+                parts.append(f"ID{servo_id}={value}")
+        
+        parts.append(f"runTime={run_time_spin.value()}s")
+        parts.append(f"wait={wait_spin.value()}s")
+        
+        cmd_str = ",".join(parts)
+        
+        # 替换指定的行
+        self.sequence_list.item(row_num - 1).setText(cmd_str)
+        
+        self.status_bar.showMessage(f"已修改第 {row_num} 行")
+    
+    def save_sequence_file(self):
+        """保存顺序执行指令到文件"""
+        if self.sequence_list.count() == 0:
+            self.status_bar.showMessage("没有内容可保存")
+            return
+        
+        # 收集所有行
+        lines = []
+        for i in range(self.sequence_list.count()):
+            lines.append(self.sequence_list.item(i).text())
+        
+        content = '\n'.join(lines)
+        
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "保存顺序指令",
+            "",
+            "文本文件 (*.txt);;所有文件 (*.*)"
+        )
+        
+        if file_path:
+            try:
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write(content)
+                self.status_bar.showMessage(f"已保存到: {os.path.basename(file_path)}")
+            except Exception as e:
+                self.status_bar.showMessage(f"保存失败: {str(e)}")
+    
+    def load_sequence_file(self):
+        """从文件读取顺序执行指令"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "读取顺序指令",
+            "",
+            "文本文件 (*.txt);;所有文件 (*.*)"
+        )
+        
+        if file_path:
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                
+                # 清空列表并添加新行
+                self.sequence_list.clear()
+                lines = content.split('\n')
+                for line in lines:
+                    if line.strip():
+                        self.sequence_list.addItem(line.strip())
+                
+                self.status_bar.showMessage(f"已读取: {os.path.basename(file_path)}")
+            except Exception as e:
+                self.status_bar.showMessage(f"读取失败: {str(e)}")
+    
+    def delete_sequence_row(self):
+        """删除选中的行"""
+        current_row = self.sequence_list.currentRow()
+        if current_row >= 0:
+            self.sequence_list.takeItem(current_row)
+            self.status_bar.showMessage(f"已删除第 {current_row + 1} 行")
+            
+            # 如果删除后还有行，选中上一行或第一行
+            if self.sequence_list.count() > 0:
+                new_row = min(current_row, self.sequence_list.count() - 1)
+                self.sequence_list.setCurrentRow(new_row)
+                self.row_select_spin.setValue(new_row + 1)
+        else:
+            self.status_bar.showMessage("请先选择要删除的行")
+    
+    def clear_sequence(self):
+        """清空所有指令"""
+        self.sequence_list.clear()
+        self.status_bar.showMessage("已清空所有指令")
+    
     def closeEvent(self, event):
         self.stop_monitoring()
+        self.stop_sequence()
+        # 停止所有定时器
+        for data in self.slider_data.values():
+            if data['timer']:
+                data['timer'].stop()
+        self.slider_data.clear()
         if self.uart and self.uart.is_open:
             self.uart.close()
         event.accept()
