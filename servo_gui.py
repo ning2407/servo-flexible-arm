@@ -51,10 +51,8 @@ class DragDropListWidget(QListWidget):
     def dropEvent(self, event):
         """拖放完成后更新行号"""
         super().dropEvent(event)
-        # 获取当前选中的行并更新父GUI的行号选择器
         current_row = self.currentRow()
         if current_row >= 0 and self.parent_gui:
-            self.parent_gui.row_select_spin.setValue(current_row + 1)
             self.parent_gui.status_bar.showMessage(f"已重新排序，当前第 {current_row + 1} 行")
 
 
@@ -772,36 +770,6 @@ class ServoControlGUI(QMainWindow):
         speed_layout.addWidget(self.servo_speed_spin)
         speed_layout.addStretch()
         
-        # 选择要修改的行
-        row_layout = QHBoxLayout()
-        row_label = QLabel("修改行:")
-        row_label.setStyleSheet("color: rgb(134, 134, 139); font-size: 14px; font-weight: 600;")
-        row_layout.addWidget(row_label)
-        
-        self.row_select_spin = QSpinBox()
-        self.row_select_spin.setRange(1, 999)
-        self.row_select_spin.setValue(1)
-        self.row_select_spin.setStyleSheet("""
-            QSpinBox {
-                background-color: rgba(0, 122, 255, 0.1);
-                color: rgb(28, 28, 30);
-                border: 2px solid transparent;
-                border-radius: 8px;
-                padding: 6px 10px;
-                font-size: 14px;
-                font-weight: 500;
-                min-width: 80px;
-            }
-            QSpinBox:hover {
-                border: 2px solid rgba(0, 122, 255, 0.3);
-            }
-            QSpinBox:focus {
-                border: 2px solid #007AFF;
-            }
-        """)
-        row_layout.addWidget(self.row_select_spin)
-        row_layout.addStretch()
-        
         # 控制按钮
         btn_layout = QHBoxLayout()
         
@@ -917,36 +885,7 @@ class ServoControlGUI(QMainWindow):
         self.add_to_sequence_btn.setEnabled(False)
         btn_layout.addWidget(self.add_to_sequence_btn)
         
-        # 修改选中行按钮
-        self.update_row_btn = QPushButton("修改选中行")
-        self.update_row_btn.setFixedHeight(36)
-        self.update_row_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #FF6B35;
-                color: white;
-                border: none;
-                border-radius: 8px;
-                padding: 0 20px;
-                font-weight: 600;
-                font-size: 14px;
-            }
-            QPushButton:hover {
-                background-color: #FF8A5C;
-            }
-            QPushButton:pressed {
-                background-color: #E05A2B;
-            }
-            QPushButton:disabled {
-                background-color: #C7C7CC;
-                color: white;
-            }
-        """)
-        self.update_row_btn.clicked.connect(self.update_sequence_row)
-        self.update_row_btn.setEnabled(False)
-        btn_layout.addWidget(self.update_row_btn)
-        
         left_layout.addLayout(speed_layout)
-        left_layout.addLayout(row_layout)
         left_layout.addLayout(btn_layout)
         
         # 滚动区域用于容纳所有舵机控制
@@ -1385,7 +1324,7 @@ class ServoControlGUI(QMainWindow):
         
         # 滑块
         slider = QSlider(Qt.Orientation.Horizontal)
-        slider.setRange(-180, 180)
+        slider.setRange(-90, 90)
         slider.setValue(0)
         slider.setStyleSheet("""
             QSlider::groove:horizontal {
@@ -1608,7 +1547,6 @@ class ServoControlGUI(QMainWindow):
             self.save_offset_btn.setEnabled(True)
             self.load_offset_btn.setEnabled(True)
             self.add_to_sequence_btn.setEnabled(True)
-            self.update_row_btn.setEnabled(True)
             self.run_sequence_btn.setEnabled(True)
             
             self.refresh_servo_info()
@@ -1758,7 +1696,6 @@ class ServoControlGUI(QMainWindow):
     def on_sequence_item_clicked(self, item):
         """点击列表项时的处理 - 同步拖动条并控制舵机"""
         row = self.sequence_list.row(item) + 1
-        self.row_select_spin.setValue(row)
         
         # 解析当前行的指令
         line_text = item.text()
@@ -1822,7 +1759,6 @@ class ServoControlGUI(QMainWindow):
         self.run_sequence_btn.setEnabled(False)
         self.stop_sequence_btn.setEnabled(True)
         self.add_to_sequence_btn.setEnabled(False)
-        self.update_row_btn.setEnabled(False)
         self.delete_seq_btn.setEnabled(False)
         self.clear_seq_btn.setEnabled(False)
         self.save_seq_btn.setEnabled(False)
@@ -1916,7 +1852,6 @@ class ServoControlGUI(QMainWindow):
         self.run_sequence_btn.setEnabled(True)
         self.stop_sequence_btn.setEnabled(False)
         self.add_to_sequence_btn.setEnabled(True)
-        self.update_row_btn.setEnabled(True)
         self.delete_seq_btn.setEnabled(True)
         self.clear_seq_btn.setEnabled(True)
         self.save_seq_btn.setEnabled(True)
@@ -2035,128 +1970,8 @@ class ServoControlGUI(QMainWindow):
         # 选中新添加的行
         new_row = self.sequence_list.count()
         self.sequence_list.setCurrentRow(new_row - 1)
-        self.row_select_spin.setValue(new_row)
         
         self.status_bar.showMessage("已添加到顺序执行")
-    
-    def update_sequence_row(self):
-        """修改顺序执行中指定的行"""
-        if not self.found_servos:
-            return
-        
-        row_num = self.row_select_spin.value()
-        
-        # 检查行号是否有效
-        if row_num < 1 or row_num > self.sequence_list.count():
-            self.status_bar.showMessage(f"行号 {row_num} 无效")
-            return
-        
-        # 从要修改的行中解析 runTime 和 wait
-        old_line = self.sequence_list.item(row_num - 1).text()
-        old_cmd = self.parse_sequence_line(old_line)
-        default_run_time = 1.0
-        default_wait = 1.0
-        if old_cmd:
-            default_run_time = old_cmd['run_time']
-            default_wait = old_cmd['wait_time']
-        
-        # 弹出对话框输入 runTime 和 wait
-        dialog = QDialog(self)
-        dialog.setWindowTitle(f"修改第 {row_num} 行")
-        dialog.setMinimumWidth(300)
-        dialog.setStyleSheet("""
-            QDialog {
-                background-color: rgb(242, 242, 247);
-            }
-            QLabel {
-                color: rgb(28, 28, 30);
-                font-size: 14px;
-                font-weight: 500;
-            }
-            QDoubleSpinBox {
-                background-color: white;
-                border: 2px solid rgba(0, 122, 255, 0.2);
-                border-radius: 8px;
-                padding: 8px 12px;
-                font-size: 14px;
-            }
-            QDoubleSpinBox:focus {
-                border: 2px solid #007AFF;
-            }
-        """)
-        
-        layout = QFormLayout(dialog)
-        layout.setSpacing(16)
-        layout.setContentsMargins(24, 24, 24, 24)
-        
-        run_time_spin = QDoubleSpinBox()
-        run_time_spin.setRange(0.1, 999.0)
-        run_time_spin.setValue(default_run_time)
-        run_time_spin.setSingleStep(0.1)
-        run_time_spin.setDecimals(1)
-        run_time_spin.setSuffix(" s")
-        
-        wait_spin = QDoubleSpinBox()
-        wait_spin.setRange(0.1, 999.0)
-        wait_spin.setValue(default_wait)
-        wait_spin.setSingleStep(0.1)
-        wait_spin.setDecimals(1)
-        wait_spin.setSuffix(" s")
-        
-        layout.addRow("运行时间:", run_time_spin)
-        layout.addRow("等待时间:", wait_spin)
-        
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("确定")
-        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
-        buttons.setStyleSheet("""
-            QPushButton {
-                background-color: #007AFF;
-                color: white;
-                border: none;
-                border-radius: 8px;
-                padding: 8px 24px;
-                font-weight: 600;
-                font-size: 14px;
-                min-width: 80px;
-            }
-            QPushButton:hover {
-                background-color: #5AC8FA;
-            }
-            QPushButton:pressed {
-                background-color: #0056CC;
-            }
-            QPushButton[text="取消"] {
-                background-color: #8E8E93;
-            }
-            QPushButton[text="取消"]:hover {
-                background-color: #AEAEB2;
-            }
-        """)
-        
-        buttons.accepted.connect(dialog.accept)
-        buttons.rejected.connect(dialog.reject)
-        layout.addRow(buttons)
-        
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-        
-        # 构建新的指令字符串
-        parts = []
-        for servo_id in sorted(self.found_servos):
-            if servo_id in self.servo_sliders:
-                value = self.servo_sliders[servo_id].value()
-                parts.append(f"ID{servo_id}={value}")
-        
-        parts.append(f"runTime={run_time_spin.value()}s")
-        parts.append(f"wait={wait_spin.value()}s")
-        
-        cmd_str = ",".join(parts)
-        
-        # 替换指定的行
-        self.sequence_list.item(row_num - 1).setText(cmd_str)
-        
-        self.status_bar.showMessage(f"已修改第 {row_num} 行")
     
     def save_sequence_file(self):
         """保存顺序执行指令到文件"""
@@ -2222,7 +2037,6 @@ class ServoControlGUI(QMainWindow):
             if self.sequence_list.count() > 0:
                 new_row = min(current_row, self.sequence_list.count() - 1)
                 self.sequence_list.setCurrentRow(new_row)
-                self.row_select_spin.setValue(new_row + 1)
         else:
             self.status_bar.showMessage("请先选择要删除的行")
     
