@@ -21,7 +21,7 @@ from PyQt6.QtWidgets import (
     QStatusBar, QProgressBar, QFrame, QScrollArea, QTabWidget,
     QDoubleSpinBox, QSpinBox, QSlider, QTextEdit, QFileDialog,
     QDialog, QFormLayout, QDialogButtonBox, QListWidget,
-    QListWidgetItem, QCheckBox
+    QListWidgetItem, QCheckBox, QLineEdit
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QMimeData
 from PyQt6.QtGui import QFont, QColor, QPalette, QIcon, QPainter, QBrush, QPen, QDrag
@@ -31,6 +31,70 @@ try:
 except ImportError:
     uservo = None
     print("提示: fashionstar_uart_sdk 未安装，部分功能不可用")
+
+# 快捷键配置文件
+SHORTCUT_FILE = "servo_shortcuts.json"
+
+# 默认快捷键配置
+DEFAULT_SHORTCUTS = {
+    'servo_1_plus': 'Key_Q',
+    'servo_1_minus': 'Key_A',
+    'servo_2_plus': 'Key_W',
+    'servo_2_minus': 'Key_S',
+    'servo_3_plus': 'Key_E',
+    'servo_3_minus': 'Key_D',
+    'servo_4_plus': 'Key_R',
+    'servo_4_minus': 'Key_F',
+    'servo_5_plus': 'Key_T',
+    'servo_5_minus': 'Key_G',
+    'servo_6_plus': 'Key_Y',
+    'servo_6_minus': 'Key_H',
+    'servo_7_plus': 'Key_U',
+    'servo_7_minus': 'Key_J',
+    'servo_8_plus': 'Key_I',
+    'servo_8_minus': 'Key_K',
+}
+
+class KeyboardMonitorThread(QThread):
+    """键盘监控线程"""
+    key_pressed = pyqtSignal(str)
+    key_released = pyqtSignal(str)
+    
+    def __init__(self):
+        super().__init__()
+        self.running = False
+        self.keys_down = set()
+        self.keys_pressed = set()  # 记录已发送过第一次按键事件的键
+        
+    def run(self):
+        self.running = True
+        import keyboard
+        while self.running:
+            for key in list(keyboard.all_modifiers) + list('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'):
+                if keyboard.is_pressed(key):
+                    key_name = f"Key_{key.upper()}" if len(key) == 1 else key
+                    if key_name not in self.keys_down:
+                        self.keys_down.add(key_name)
+                        self.keys_pressed.add(key_name)
+                        self.key_pressed.emit(key_name)
+                else:
+                    key_name_upper = f"Key_{key.upper()}"
+                    if key_name_upper in self.keys_down:
+                        self.keys_down.remove(key_name_upper)
+                        self.keys_pressed.discard(key_name_upper)
+                        self.key_released.emit(key_name_upper)
+                    elif key in self.keys_down:
+                        self.keys_down.remove(key)
+                        self.keys_pressed.discard(key)
+                        self.key_released.emit(key)
+            time.sleep(0.05)  # 50ms扫描一次
+    
+    def stop(self):
+        self.running = False
+    
+    def is_key_down(self, key_name):
+        """检查按键是否正在按下"""
+        return key_name in self.keys_down
 
 
 class DragDropListWidget(QListWidget):
@@ -235,8 +299,17 @@ class ServoControlGUI(QMainWindow):
         self.waiting_timer = None
         self.loop_count = 0
         
+        # 快捷键相关
+        self.shortcuts = {}  # 存储快捷键配置
+        self.keyboard_thread = None
+        self.shortcut_step = 5  # 每次按键调整的角度步长
+        self.shortcut_enabled = False  # 快捷键是否启用
+        self.shortcut_period = 200  # 快捷键发送周期(ms)，同时用于命令总时间
+        self.long_press_timers = {}  # 存储长按定时器 {key_name: timer}
+        
         self.init_ui()
         self.refresh_ports()
+        self.load_shortcuts()
 
     def init_ui(self):
         self.setWindowTitle("Fashion Star 舵机控制")
@@ -770,6 +843,119 @@ class ServoControlGUI(QMainWindow):
         speed_layout.addWidget(self.servo_speed_spin)
         speed_layout.addStretch()
         
+        # 快捷键控制区域
+        shortcut_layout = QHBoxLayout()
+        shortcut_layout.setSpacing(12)
+        
+        # 快捷键启用开关
+        self.shortcut_checkbox = QCheckBox("启用快捷键")
+        self.shortcut_checkbox.setStyleSheet("""
+            QCheckBox {
+                color: rgb(28, 28, 30);
+                font-size: 13px;
+                font-weight: 500;
+                spacing: 8px;
+            }
+            QCheckBox::indicator {
+                width: 20px;
+                height: 20px;
+                border: 2px solid rgba(0, 122, 255, 0.3);
+                border-radius: 4px;
+                background-color: white;
+            }
+            QCheckBox::indicator:checked {
+                background-color: #007AFF;
+                border: 2px solid #007AFF;
+            }
+        """)
+        self.shortcut_checkbox.stateChanged.connect(self.on_shortcut_toggled)
+        shortcut_layout.addWidget(self.shortcut_checkbox)
+        
+        # 步长设置
+        step_label = QLabel("步长:")
+        step_label.setStyleSheet("color: rgb(134, 134, 139); font-size: 13px; font-weight: 600;")
+        shortcut_layout.addWidget(step_label)
+        
+        self.shortcut_step_spin = QSpinBox()
+        self.shortcut_step_spin.setRange(1, 30)
+        self.shortcut_step_spin.setValue(5)
+        self.shortcut_step_spin.setSuffix("°")
+        self.shortcut_step_spin.setStyleSheet("""
+            QSpinBox {
+                background-color: rgba(0, 122, 255, 0.1);
+                color: rgb(28, 28, 30);
+                border: 2px solid transparent;
+                border-radius: 8px;
+                padding: 4px 8px;
+                font-size: 13px;
+                font-weight: 500;
+                min-width: 70px;
+            }
+            QSpinBox:hover {
+                border: 2px solid rgba(0, 122, 255, 0.3);
+            }
+            QSpinBox:focus {
+                border: 2px solid #007AFF;
+            }
+        """)
+        self.shortcut_step_spin.valueChanged.connect(self.on_shortcut_step_changed)
+        shortcut_layout.addWidget(self.shortcut_step_spin)
+        
+        # 周期设置（同时用于发送间隔和命令总时间）
+        period_label = QLabel("周期:")
+        period_label.setStyleSheet("color: rgb(134, 134, 139); font-size: 13px; font-weight: 600;")
+        shortcut_layout.addWidget(period_label)
+        
+        self.shortcut_period_spin = QSpinBox()
+        self.shortcut_period_spin.setRange(50, 1000)
+        self.shortcut_period_spin.setValue(200)
+        self.shortcut_period_spin.setSuffix("ms")
+        self.shortcut_period_spin.setStyleSheet("""
+            QSpinBox {
+                background-color: rgba(0, 122, 255, 0.1);
+                color: rgb(28, 28, 30);
+                border: 2px solid transparent;
+                border-radius: 8px;
+                padding: 4px 8px;
+                font-size: 13px;
+                font-weight: 500;
+                min-width: 80px;
+            }
+            QSpinBox:hover {
+                border: 2px solid rgba(0, 122, 255, 0.3);
+            }
+            QSpinBox:focus {
+                border: 2px solid #007AFF;
+            }
+        """)
+        self.shortcut_period_spin.valueChanged.connect(self.on_shortcut_period_changed)
+        shortcut_layout.addWidget(self.shortcut_period_spin)
+        
+        # 快捷键配置按钮
+        self.config_shortcut_btn = QPushButton("配置快捷键")
+        self.config_shortcut_btn.setFixedHeight(30)
+        self.config_shortcut_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #007AFF;
+                color: white;
+                border: none;
+                border-radius: 6px;
+                padding: 0 16px;
+                font-weight: 500;
+                font-size: 12px;
+            }
+            QPushButton:hover {
+                background-color: #5AC8FA;
+            }
+            QPushButton:pressed {
+                background-color: #0056CC;
+            }
+        """)
+        self.config_shortcut_btn.clicked.connect(self.show_shortcut_config)
+        shortcut_layout.addWidget(self.config_shortcut_btn)
+        
+        shortcut_layout.addStretch()
+        
         # 控制按钮
         btn_layout = QHBoxLayout()
         
@@ -886,6 +1072,7 @@ class ServoControlGUI(QMainWindow):
         btn_layout.addWidget(self.add_to_sequence_btn)
         
         left_layout.addLayout(speed_layout)
+        left_layout.addLayout(shortcut_layout)
         left_layout.addLayout(btn_layout)
         
         # 滚动区域用于容纳所有舵机控制
@@ -1223,6 +1410,8 @@ class ServoControlGUI(QMainWindow):
         self.found_servos = []
         self.last_servo_data = {}
         self.stop_monitoring()
+        self.stop_keyboard_monitor()
+        self.shortcut_checkbox.setChecked(False)
         self.clear_sync_controls()
         
         # 重新启用串口和波特率选择，禁用控制功能
@@ -1283,7 +1472,7 @@ class ServoControlGUI(QMainWindow):
         self.table.setRowCount(0)
         self.found_servos = []
         
-        self.scanner_thread = ServoScannerThread(self.servo_manager, 0, 100)
+        self.scanner_thread = ServoScannerThread(self.servo_manager, 0, 10)
         self.scanner_thread.progress.connect(self.on_scan_progress)
         self.scanner_thread.found.connect(self.on_servo_found)
         self.scanner_thread.finished.connect(self.on_scan_finished)
@@ -1429,16 +1618,52 @@ class ServoControlGUI(QMainWindow):
                 data['timer'].stop()
         self.slider_data.clear()
         
-        # 将所有滑块设为0，并发送命令
+        # 停止所有长按定时器
+        for timer in self.long_press_timers.values():
+            timer.stop()
+        self.long_press_timers.clear()
+        
+        # 将所有滑块设为0
         for servo_id, slider in self.servo_sliders.items():
             slider.setValue(0)
-            # 直接发送归零命令
+        
+        # 使用同步命令一次性发送所有舵机的归零指令
+        command_data_list = []
+        t_acc = 200    # 启动加速时间 (ms)
+        t_dec = 200    # 运动减速时间 (ms)
+        power = 10000  # 功率 (mW)
+        interval = 3000  # 总时间 (ms)
+        
+        for servo_id in self.servo_sliders.keys():
+            offset = self.servo_offsets.get(servo_id, 0.0)
+            target_angle = offset  # 滑块值为0时 = 零偏角度
+            
+            packed_data = struct.pack(
+                '<BlLHHH',
+                servo_id,
+                int(target_angle * 10),  # 角度需要放大10倍
+                interval,
+                t_acc,
+                t_dec,
+                power
+            )
+            command_data_list.append(packed_data)
+        
+        # 发送同步归零命令
+        if command_data_list:
             try:
-                offset = self.servo_offsets.get(servo_id, 0.0)
-                target_angle = offset  # 滑块值为0时 = 零偏角度
-                self.servo_manager.set_servo_angle(servo_id, target_angle, is_mturn=True, velocity=self.servo_speed)
+                self.servo_manager.send_sync_multiturnanglebyinterval(
+                    command_id=14,
+                    servo_num=len(command_data_list),
+                    command_data_list=command_data_list
+                )
             except Exception as e:
-                pass
+                print(f"发送归零命令失败: {e}")
+        
+        # 如果快捷键已启用，重新启动键盘监控线程以重置线程内数据
+        if self.shortcut_enabled:
+            self.stop_keyboard_monitor()
+            self.start_keyboard_monitor()
         
         self.status_bar.showMessage("所有舵机已归零")
 
@@ -2045,9 +2270,463 @@ class ServoControlGUI(QMainWindow):
         self.sequence_list.clear()
         self.status_bar.showMessage("已清空所有指令")
     
+    # ==================== 快捷键功能 ====================
+    
+    def load_shortcuts(self):
+        """加载快捷键配置"""
+        if os.path.exists(SHORTCUT_FILE):
+            try:
+                with open(SHORTCUT_FILE, 'r', encoding='utf-8') as f:
+                    self.shortcuts = json.load(f)
+            except:
+                self.shortcuts = DEFAULT_SHORTCUTS.copy()
+        else:
+            self.shortcuts = DEFAULT_SHORTCUTS.copy()
+    
+    def save_shortcuts(self):
+        """保存快捷键配置"""
+        try:
+            with open(SHORTCUT_FILE, 'w', encoding='utf-8') as f:
+                json.dump(self.shortcuts, f, ensure_ascii=False, indent=2)
+            self.status_bar.showMessage("快捷键配置已保存")
+        except Exception as e:
+            self.status_bar.showMessage(f"保存快捷键失败: {str(e)}")
+    
+    def on_shortcut_toggled(self, state):
+        """快捷键开关状态变化"""
+        self.shortcut_enabled = (state == Qt.CheckState.Checked.value)
+        
+        if self.shortcut_enabled:
+            if not self.connected:
+                self.status_bar.showMessage("请先连接串口")
+                self.shortcut_checkbox.setChecked(False)
+                self.shortcut_enabled = False
+                return
+            
+            # 禁用所有拖动条
+            for servo_id, slider in self.servo_sliders.items():
+                slider.setEnabled(False)
+            
+            # 启动键盘监控线程
+            self.start_keyboard_monitor()
+            self.status_bar.showMessage("快捷键已启用，拖动条已锁定")
+        else:
+            # 停止键盘监控线程
+            self.stop_keyboard_monitor()
+            
+            # 启用所有拖动条
+            for servo_id, slider in self.servo_sliders.items():
+                slider.setEnabled(True)
+            
+            self.status_bar.showMessage("快捷键已禁用，拖动条已解锁")
+    
+    def on_shortcut_step_changed(self, value):
+        """步长变化"""
+        self.shortcut_step = value
+    
+    def on_shortcut_period_changed(self, value):
+        """周期变化"""
+        self.shortcut_period = value
+    
+    def start_keyboard_monitor(self):
+        """启动键盘监控线程"""
+        if self.keyboard_thread and self.keyboard_thread.isRunning():
+            return
+        
+        self.keyboard_thread = KeyboardMonitorThread()
+        self.keyboard_thread.key_pressed.connect(self.on_key_pressed)
+        self.keyboard_thread.key_released.connect(self.on_key_released)
+        self.keyboard_thread.start()
+    
+    def stop_keyboard_monitor(self):
+        """停止键盘监控线程"""
+        if self.keyboard_thread:
+            self.keyboard_thread.stop()
+            self.keyboard_thread.wait()
+            self.keyboard_thread = None
+        
+        # 停止所有长按定时器
+        for timer in self.long_press_timers.values():
+            timer.stop()
+        self.long_press_timers.clear()
+    
+    def on_key_pressed(self, key_name):
+        """处理按键事件（包括长按）"""
+        if not self.shortcut_enabled or not self.connected:
+            return
+        
+        # 查找匹配的快捷键
+        servo_id = None
+        direction = 0
+        
+        for key, value in self.shortcuts.items():
+            if value == key_name:
+                if '_plus' in key:
+                    servo_id = int(key.split('_')[1])
+                    direction = 1
+                elif '_minus' in key:
+                    servo_id = int(key.split('_')[1])
+                    direction = -1
+                break
+        
+        if servo_id and direction != 0:
+            # 处理单次按键
+            self.handle_shortcut_command(servo_id, direction)
+            
+            # 设置长按定时器（首次延迟300ms，之后按周期发送）
+            if key_name not in self.long_press_timers:
+                timer = QTimer()
+                timer.setInterval(self.shortcut_period)  # 长按期间按设置的周期发送
+                timer.timeout.connect(lambda id=servo_id, dir=direction, kn=key_name: self.handle_long_press(id, dir, kn))
+                self.long_press_timers[key_name] = timer
+                # 首次长按延迟300ms后开始连续发送
+                QTimer.singleShot(300, timer.start)
+    
+    def on_key_released(self, key_name):
+        """处理按键释放事件"""
+        # 停止长按定时器
+        if key_name in self.long_press_timers:
+            self.long_press_timers[key_name].stop()
+            del self.long_press_timers[key_name]
+    
+    def handle_long_press(self, servo_id, direction, key_name):
+        """处理长按事件 - 每500ms发送一次新的角度"""
+        # 检查按键是否仍然按下
+        if self.keyboard_thread and self.keyboard_thread.is_key_down(key_name):
+            self.handle_shortcut_command(servo_id, direction)
+    
+    def handle_shortcut_command(self, servo_id, direction):
+        """处理快捷键指令"""
+        if servo_id not in self.servo_sliders:
+            return
+        
+        slider = self.servo_sliders[servo_id]
+        current_value = slider.value()
+        new_value = current_value + direction * self.shortcut_step
+        
+        # 限制在 -90 到 90 范围内
+        new_value = max(-90, min(90, new_value))
+        
+        # 只有当值确实变化时才更新和发送命令
+        if new_value != current_value:
+            # 更新滑块
+            slider.setValue(new_value)
+            
+            # 发送同步控制命令
+            self.send_shortcut_sync_command(servo_id, new_value)
+    
+    def send_shortcut_sync_command(self, servo_id, target_offset):
+        """发送快捷键同步控制命令"""
+        if not self.connected or not self.servo_manager:
+            return
+        
+        try:
+            zero_offset = self.servo_offsets.get(servo_id, 0.0)
+            target_angle = zero_offset + target_offset
+            
+            # 使用设置的周期作为命令总时间，加速减速时间为周期的四分之一
+            interval = self.shortcut_period  # 总时间 = 设置的周期
+            t_acc = max(20, interval // 4)  # 启动加速时间 = 周期的1/4，最小20ms
+            t_dec = max(20, interval // 4)  # 运动减速时间 = 周期的1/4，最小20ms
+            power = 15000  # 功率 (mW)
+            
+            packed_data = struct.pack(
+                '<BlLHHH',
+                servo_id,
+                int(target_angle * 10),  # 角度需要放大10倍
+                interval,
+                t_acc,
+                t_dec,
+                power
+            )
+            
+            self.servo_manager.send_sync_multiturnanglebyinterval(
+                command_id=14,
+                servo_num=1,
+                command_data_list=[packed_data]
+            )
+            
+            self.status_bar.showMessage(f"舵机 {servo_id}: {target_offset}°")
+        except Exception as e:
+            print(f"发送快捷键命令失败: {e}")
+    
+    def show_shortcut_config(self):
+        """显示快捷键配置对话框"""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("配置快捷键")
+        dialog.setMinimumWidth(400)
+        dialog.setStyleSheet("""
+            QDialog {
+                background-color: rgb(242, 242, 247);
+            }
+            QLabel {
+                color: rgb(28, 28, 30);
+                font-size: 14px;
+                font-weight: 500;
+            }
+            QLineEdit {
+                background-color: white;
+                border: 2px solid rgba(0, 122, 255, 0.2);
+                border-radius: 8px;
+                padding: 8px 12px;
+                font-size: 14px;
+            }
+            QLineEdit:focus {
+                border: 2px solid #007AFF;
+            }
+        """)
+        
+        layout = QVBoxLayout(dialog)
+        layout.setSpacing(12)
+        layout.setContentsMargins(24, 24, 24, 24)
+        
+        # 创建表格布局
+        grid_layout = QGridLayout()
+        grid_layout.setSpacing(12)
+        
+        # 表头
+        header_label = QLabel("舵机ID")
+        header_label.setStyleSheet("font-weight: 600; color: rgb(134, 134, 139);")
+        grid_layout.addWidget(header_label, 0, 0)
+        
+        plus_header = QLabel("增加 (+)")
+        plus_header.setStyleSheet("font-weight: 600; color: rgb(52, 199, 89);")
+        grid_layout.addWidget(plus_header, 0, 1)
+        
+        minus_header = QLabel("减小 (-)")
+        minus_header.setStyleSheet("font-weight: 600; color: rgb(255, 59, 48);")
+        grid_layout.addWidget(minus_header, 0, 2)
+        
+        row = 1
+        
+        # 只显示扫描到的舵机ID
+        servo_ids_to_show = sorted(self.found_servos) if self.found_servos else range(1, 5)
+        
+        for servo_id in servo_ids_to_show:
+            # 舵机ID标签
+            id_label = QLabel(f"ID {servo_id}")
+            id_label.setStyleSheet("font-weight: 600;")
+            grid_layout.addWidget(id_label, row, 0)
+            
+            # 增加快捷键 - 使用按键捕获模式
+            plus_edit = QLineEdit()
+            plus_edit.setText(self.shortcuts.get(f'servo_{servo_id}_plus', ''))
+            plus_edit.setPlaceholderText("点击设置")
+            plus_edit.setObjectName(f'plus_{servo_id}')
+            plus_edit.setReadOnly(True)
+            plus_edit.mousePressEvent = lambda event, edit=plus_edit, sid=servo_id, typ='plus': self.on_shortcut_edit_clicked(event, edit, sid, typ)
+            plus_edit.setStyleSheet("""
+                QLineEdit {
+                    background-color: white;
+                    border: 2px solid rgba(52, 199, 89, 0.3);
+                    border-radius: 8px;
+                    padding: 8px 12px;
+                    font-size: 14px;
+                    cursor: pointer;
+                }
+                QLineEdit:focus {
+                    border: 2px solid #34C759;
+                    background-color: rgba(52, 199, 89, 0.05);
+                }
+                QLineEdit[text=""] {
+                    color: rgb(134, 134, 139);
+                }
+            """)
+            grid_layout.addWidget(plus_edit, row, 1)
+            
+            # 减小快捷键 - 使用按键捕获模式
+            minus_edit = QLineEdit()
+            minus_edit.setText(self.shortcuts.get(f'servo_{servo_id}_minus', ''))
+            minus_edit.setPlaceholderText("点击设置")
+            minus_edit.setObjectName(f'minus_{servo_id}')
+            minus_edit.setReadOnly(True)
+            minus_edit.mousePressEvent = lambda event, edit=minus_edit, sid=servo_id, typ='minus': self.on_shortcut_edit_clicked(event, edit, sid, typ)
+            minus_edit.setStyleSheet("""
+                QLineEdit {
+                    background-color: white;
+                    border: 2px solid rgba(255, 59, 48, 0.3);
+                    border-radius: 8px;
+                    padding: 8px 12px;
+                    font-size: 14px;
+                    cursor: pointer;
+                }
+                QLineEdit:focus {
+                    border: 2px solid #FF3B30;
+                    background-color: rgba(255, 59, 48, 0.05);
+                }
+                QLineEdit[text=""] {
+                    color: rgb(134, 134, 139);
+                }
+            """)
+            grid_layout.addWidget(minus_edit, row, 2)
+            
+            row += 1
+        
+        # 当前正在监听的输入框
+        self.current_listening_edit = None
+        self.current_listening_servo_id = None
+        self.current_listening_type = None
+        
+        layout.addLayout(grid_layout)
+        
+        # 重置按钮
+        reset_btn = QPushButton("重置为默认")
+        reset_btn.setFixedHeight(36)
+        reset_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #FF9500;
+                color: white;
+                border: none;
+                border-radius: 8px;
+                padding: 0 20px;
+                font-weight: 600;
+                font-size: 14px;
+            }
+            QPushButton:hover {
+                background-color: #FFB340;
+            }
+        """)
+        reset_btn.clicked.connect(lambda: self.reset_shortcuts(dialog))
+        layout.addWidget(reset_btn)
+        
+        # 确定/取消按钮
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("确定")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        buttons.setStyleSheet("""
+            QPushButton {
+                background-color: #007AFF;
+                color: white;
+                border: none;
+                border-radius: 8px;
+                padding: 8px 24px;
+                font-weight: 600;
+                font-size: 14px;
+                min-width: 80px;
+            }
+            QPushButton:hover {
+                background-color: #5AC8FA;
+            }
+            QPushButton[text="取消"] {
+                background-color: #8E8E93;
+            }
+        """)
+        
+        buttons.accepted.connect(lambda: self.save_shortcut_config(dialog))
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        
+        dialog.exec()
+    
+    def on_shortcut_edit_clicked(self, event, edit, servo_id, edit_type):
+        """点击快捷键输入框时开始监听按键"""
+        # 如果已经在监听，先取消之前的监听
+        if self.current_listening_edit:
+            self.current_listening_edit.setText(self.shortcuts.get(f'servo_{self.current_listening_servo_id}_{self.current_listening_type}', ''))
+            self.current_listening_edit.setStyleSheet("""
+                QLineEdit {
+                    background-color: white;
+                    border: 2px solid rgba(52, 199, 89, 0.3);
+                    border-radius: 8px;
+                    padding: 8px 12px;
+                    font-size: 14px;
+                    cursor: pointer;
+                }
+            """)
+        
+        # 设置当前监听状态
+        self.current_listening_edit = edit
+        self.current_listening_servo_id = servo_id
+        self.current_listening_type = edit_type
+        
+        # 设置监听状态样式
+        edit.setText("...")
+        edit.setStyleSheet("""
+            QLineEdit {
+                background-color: rgba(0, 122, 255, 0.1);
+                border: 2px dashed #007AFF;
+                border-radius: 8px;
+                padding: 8px 12px;
+                font-size: 14px;
+                color: #007AFF;
+                font-weight: 600;
+            }
+        """)
+        
+        # 启动按键监听
+        import keyboard
+        keyboard.on_press(self.capture_key_for_shortcut)
+    
+    def capture_key_for_shortcut(self, event):
+        """捕获按键并设置到当前输入框"""
+        if not self.current_listening_edit:
+            return
+        
+        try:
+            key_name = event.name
+            # 处理特殊键名
+            if len(key_name) == 1:
+                key_name = f"Key_{key_name.upper()}"
+            elif key_name in ['space', 'enter', 'backspace', 'tab']:
+                key_name = f"Key_{key_name.capitalize()}"
+            
+            # 设置按键名到输入框
+            self.current_listening_edit.setText(key_name)
+            
+            # 保存到临时配置
+            self.shortcuts[f'servo_{self.current_listening_servo_id}_{self.current_listening_type}'] = key_name
+            
+            # 恢复输入框样式
+            self.current_listening_edit.setStyleSheet("""
+                QLineEdit {
+                    background-color: white;
+                    border: 2px solid rgba(52, 199, 89, 0.3);
+                    border-radius: 8px;
+                    padding: 8px 12px;
+                    font-size: 14px;
+                    cursor: pointer;
+                }
+            """)
+            
+            # 清除监听状态
+            import keyboard
+            keyboard.unhook_all()
+            self.current_listening_edit = None
+            self.current_listening_servo_id = None
+            self.current_listening_type = None
+            
+        except Exception as e:
+            print(f"捕获按键失败: {e}")
+    
+    def reset_shortcuts(self, dialog):
+        """重置快捷键为默认值"""
+        servo_ids_to_reset = sorted(self.found_servos) if self.found_servos else range(1, 5)
+        for servo_id in servo_ids_to_reset:
+            plus_edit = dialog.findChild(QLineEdit, f'plus_{servo_id}')
+            minus_edit = dialog.findChild(QLineEdit, f'minus_{servo_id}')
+            if plus_edit:
+                plus_edit.setText(DEFAULT_SHORTCUTS.get(f'servo_{servo_id}_plus', ''))
+            if minus_edit:
+                minus_edit.setText(DEFAULT_SHORTCUTS.get(f'servo_{servo_id}_minus', ''))
+    
+    def save_shortcut_config(self, dialog):
+        """保存快捷键配置"""
+        servo_ids_to_save = sorted(self.found_servos) if self.found_servos else range(1, 5)
+        for servo_id in servo_ids_to_save:
+            plus_edit = dialog.findChild(QLineEdit, f'plus_{servo_id}')
+            minus_edit = dialog.findChild(QLineEdit, f'minus_{servo_id}')
+            if plus_edit:
+                self.shortcuts[f'servo_{servo_id}_plus'] = plus_edit.text()
+            if minus_edit:
+                self.shortcuts[f'servo_{servo_id}_minus'] = minus_edit.text()
+        
+        self.save_shortcuts()
+        dialog.accept()
+    
     def closeEvent(self, event):
         self.stop_monitoring()
         self.stop_sequence()
+        self.stop_keyboard_monitor()
         # 停止所有定时器
         for data in self.slider_data.values():
             if data['timer']:

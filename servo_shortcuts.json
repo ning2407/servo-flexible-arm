@@ -1,0 +1,18 @@
+{
+  "servo_1_plus": "Key_Q",
+  "servo_1_minus": "Key_A",
+  "servo_2_plus": "Key_W",
+  "servo_2_minus": "Key_S",
+  "servo_3_plus": "Key_E",
+  "servo_3_minus": "Key_D",
+  "servo_4_plus": "Key_R",
+  "servo_4_minus": "Key_F",
+  "servo_5_plus": "Key_T",
+  "servo_5_minus": "Key_G",
+  "servo_6_plus": "Key_Y",
+  "servo_6_minus": "Key_H",
+  "servo_7_plus": "Key_U",
+  "servo_7_minus": "Key_J",
+  "servo_8_plus": "Key_I",
+  "servo_8_minus": "Key_K"
+}
