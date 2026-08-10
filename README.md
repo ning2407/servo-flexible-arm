@@ -32,6 +32,45 @@ pip install PyQt6
 python servo_gui.py
 ```
 
+## Python SDK
+
+硬件控制已从 GUI 中拆分为独立的 `flexible_arm` SDK。应用程序应通过
+`FlexibleArm` 控制机械臂，不需要直接调用 FashionStar 厂商库。
+
+```python
+from flexible_arm import FlexibleArm, JointConfig
+
+joints = [
+    JointConfig("base", 1, min_deg=-90, max_deg=90),
+    JointConfig(
+        "shoulder",
+        2,
+        zero_offset_deg=5,
+        direction=-1,
+        min_deg=-70,
+        max_deg=110,
+    ),
+]
+
+arm = FlexibleArm(joints)
+arm.connect("COM3")
+arm.move_joint("base", 30)
+arm.move_joints({"base": 0, "shoulder": 20}, duration=1.5)
+print(arm.get_state())
+arm.disconnect()
+```
+
+本地开发安装：
+
+```bash
+python3 -m pip install -e ".[gui,test]"
+python3 -m pytest
+```
+
+SDK 支持关节零偏与方向换算、关节/速度限位、同步运动、状态读取、
+后台轨迹执行、暂停、恢复和停止。没有硬件时可以使用
+`VirtualServoDriver` 开发和测试，示例见 `examples/`。
+
 **操作步骤：**
 1. 从下拉菜单选择串口
 2. 点击"连接"按钮

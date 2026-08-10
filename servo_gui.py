@@ -5,12 +5,10 @@ Fashion Star 总线伺服舵机 - iOS风格现代化GUI界面
 清新、简洁、精致的设计
 """
 
-import sys
 import time
 import sys
 import os
 import json
-import struct
 import serial
 import serial.tools.list_ports
 from typing import List, Dict, Optional
@@ -50,11 +48,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QMimeData
 from PyQt6.QtGui import QFont, QColor, QPalette, QIcon, QPainter, QBrush, QPen, QDrag
 
-try:
-    import fashionstar_uart_sdk as uservo
-except ImportError:
-    uservo = None
-    print("提示: fashionstar_uart_sdk 未安装，部分功能不可用")
+from flexible_arm import FlexibleArm, JointConfig
 
 # 快捷键配置文件
 SHORTCUT_FILE = "servo_shortcuts.json"
@@ -160,9 +154,9 @@ class ServoScannerThread(QThread):
     finished = pyqtSignal(list)
     serial_error = pyqtSignal()
 
-    def __init__(self, servo_manager, start_id=0, end_id=30):
+    def __init__(self, arm, start_id=0, end_id=30):
         super().__init__()
-        self.servo_manager = servo_manager
+        self.arm = arm
         self.start_id = start_id
         self.end_id = end_id
         self.error_count = 0
@@ -176,7 +170,7 @@ class ServoScannerThread(QThread):
                 self.serial_error.emit()
                 break
             try:
-                is_online = self.servo_manager.ping(servo_id)
+                is_online = self.arm.ping(servo_id)
                 if is_online:
                     found.append(servo_id)
                     self.found.emit(servo_id)
@@ -193,9 +187,9 @@ class ServoInfoThread(QThread):
     finished = pyqtSignal()
     serial_error = pyqtSignal()
 
-    def __init__(self, servo_manager, servo_ids):
+    def __init__(self, arm, servo_ids):
         super().__init__()
-        self.servo_manager = servo_manager
+        self.arm = arm
         self.servo_ids = servo_ids
         self.error_count = 0
         self.max_errors = 3
@@ -212,19 +206,15 @@ class ServoInfoThread(QThread):
 
     def get_servo_info(self, servo_id):
         try:
-            angle = self.servo_manager.query_servo_angle(servo_id)
-        except:
-            angle = None
-            self.error_count += 1
-
-        try:
-            voltage = self.servo_manager.query_voltage(servo_id)
-            current = self.servo_manager.query_current(servo_id)
-            power = self.servo_manager.query_power(servo_id)
-            temp = self.servo_manager.query_temperature(servo_id)
-            status = self.servo_manager.query_status(servo_id)
-        except:
-            voltage = current = power = temp = status = None
+            state = self.arm.read_servo_state(servo_id)
+            angle = state.angle_deg
+            voltage = state.voltage_v
+            current = state.current_a
+            power = state.power_w
+            temp = state.temperature
+            status = state.status
+        except Exception:
+            angle = voltage = current = power = temp = status = None
             self.error_count += 1
 
         return {
@@ -245,32 +235,25 @@ class SyncMonitorThread(QThread):
     finished = pyqtSignal()
     serial_error = pyqtSignal()
 
-    def __init__(self, servo_manager, servo_ids):
+    def __init__(self, arm, servo_ids):
         super().__init__()
-        self.servo_manager = servo_manager
+        self.arm = arm
         self.servo_ids = servo_ids
         self.error_count = 0
         self.max_errors = 3
 
     def run(self):
         try:
-            # 使用同步监控命令一次性获取所有舵机数据
-            servo_monitor_data = self.servo_manager.send_sync_servo_monitor(
-                self.servo_ids
-            )
-
-            # 转换所有数据格式
+            servo_monitor_data = self.arm.read_servo_states(self.servo_ids)
             result_dict = {}
             for servo_id, info in servo_monitor_data.items():
                 if info:
                     result_dict[servo_id] = {
                         "id": servo_id,
-                        "angle": info.angle_monitor,
+                        "angle": info.angle_deg,
                         "turn": info.turn,
-                        "power": (
-                            info.power / 1000.0 if info.power is not None else None
-                        ),
-                        "temp": info.temp,
+                        "power": info.power_w,
+                        "temp": info.temperature,
                     }
 
             self.all_info_ready.emit(result_dict)
@@ -320,8 +303,7 @@ class StatusIndicator(QWidget):
 class ServoControlGUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.servo_manager: Optional[uservo.UartServoManager] = None
-        self.uart: Optional[serial.Serial] = None
+        self.arm = FlexibleArm()
         self.connected = False
         self.found_servos = []
         self.refresh_timer = QTimer()
@@ -1435,15 +1417,7 @@ class ServoControlGUI(QMainWindow):
 
         try:
             baudrate = int(self.baud_combo.currentText())
-            self.uart = serial.Serial(
-                port=port,
-                baudrate=baudrate,
-                parity=serial.PARITY_NONE,
-                stopbits=1,
-                bytesize=8,
-                timeout=0.1,
-            )
-            self.servo_manager = uservo.UartServoManager(self.uart, is_debug=False)
+            self.arm.connect(port, baudrate)
             self.connected = True
 
             # 禁用串口和波特率选择，启用扫描按钮
@@ -1477,8 +1451,7 @@ class ServoControlGUI(QMainWindow):
             self.status_bar.showMessage(f"连接失败: {str(e)}")
 
     def disconnect(self):
-        if self.uart and self.uart.is_open:
-            self.uart.close()
+        self.arm.disconnect()
 
         # 停止所有拖动条定时器
         for data in self.slider_data.values():
@@ -1486,7 +1459,6 @@ class ServoControlGUI(QMainWindow):
                 data["timer"].stop()
         self.slider_data.clear()
 
-        self.servo_manager = None
         self.connected = False
         self.found_servos = []
         self.last_servo_data = {}
@@ -1555,7 +1527,7 @@ class ServoControlGUI(QMainWindow):
         self.table.setRowCount(0)
         self.found_servos = []
 
-        self.scanner_thread = ServoScannerThread(self.servo_manager, 0, 10)
+        self.scanner_thread = ServoScannerThread(self.arm, 0, 10)
         self.scanner_thread.progress.connect(self.on_scan_progress)
         self.scanner_thread.found.connect(self.on_servo_found)
         self.scanner_thread.finished.connect(self.on_scan_finished)
@@ -1683,15 +1655,12 @@ class ServoControlGUI(QMainWindow):
 
         data = self.slider_data[servo_id]
 
-        if self.connected and self.servo_manager:
+        if self.connected:
             try:
-                # 零偏角度 + 拖动条数值
-                offset = self.servo_offsets.get(servo_id, 0.0)
-                target_angle = offset + data["current_value"]
-                self.servo_manager.set_servo_angle(
-                    servo_id, target_angle, is_mturn=True, velocity=self.servo_speed
+                self.arm.move_joint(
+                    servo_id, data["current_value"], velocity=self.servo_speed
                 )
-            except Exception as e:
+            except Exception:
                 pass
 
         # 处理松开后的发送逻辑
@@ -1704,7 +1673,7 @@ class ServoControlGUI(QMainWindow):
 
     def reset_all_servos(self):
         """将所有舵机归零（回到零偏角度）"""
-        if not self.connected or not self.servo_manager:
+        if not self.connected:
             return
 
         # 先停止所有正在进行的拖动
@@ -1722,35 +1691,13 @@ class ServoControlGUI(QMainWindow):
         for servo_id, slider in self.servo_sliders.items():
             slider.setValue(0)
 
-        # 使用同步命令一次性发送所有舵机的归零指令
-        command_data_list = []
-        t_acc = 200  # 启动加速时间 (ms)
-        t_dec = 200  # 运动减速时间 (ms)
-        power = 10000  # 功率 (mW)
-        interval = 3000  # 总时间 (ms)
-
-        for servo_id in self.servo_sliders.keys():
-            offset = self.servo_offsets.get(servo_id, 0.0)
-            target_angle = offset  # 滑块值为0时 = 零偏角度
-
-            packed_data = struct.pack(
-                "<BlLHHH",
-                servo_id,
-                int(target_angle * 10),  # 角度需要放大10倍
-                interval,
-                t_acc,
-                t_dec,
-                power,
-            )
-            command_data_list.append(packed_data)
-
-        # 发送同步归零命令
-        if command_data_list:
+        if self.servo_sliders:
             try:
-                self.servo_manager.send_sync_multiturnanglebyinterval(
-                    command_id=14,
-                    servo_num=len(command_data_list),
-                    command_data_list=command_data_list,
+                self.arm.move_joints(
+                    {servo_id: 0.0 for servo_id in self.servo_sliders},
+                    duration=3.0,
+                    acceleration_ms=200,
+                    deceleration_ms=200,
                 )
             except Exception as e:
                 print(f"发送归零命令失败: {e}")
@@ -1793,6 +1740,7 @@ class ServoControlGUI(QMainWindow):
                 self.status_bar.showMessage(
                     f"已加载零偏文件: {len(self.servo_offsets)} 个舵机"
                 )
+                self.apply_joint_config()
             except json.JSONDecodeError:
                 self.status_bar.showMessage("零偏文件格式损坏")
                 self.servo_offsets = {}
@@ -1803,9 +1751,23 @@ class ServoControlGUI(QMainWindow):
             self.servo_offsets = {}
             self.status_bar.showMessage("零偏文件不存在")
 
+    def apply_joint_config(self):
+        """Push GUI calibration into the SDK's joint model."""
+        for servo_id in self.found_servos:
+            self.arm.configure_joint(
+                JointConfig(
+                    name=f"joint_{servo_id}",
+                    servo_id=servo_id,
+                    zero_offset_deg=self.servo_offsets.get(servo_id, 0.0),
+                    min_deg=-175.0,
+                    max_deg=175.0,
+                    max_speed_dps=2000.0,
+                )
+            )
+
     def save_offsets(self):
         """保存当前角度为零偏（使用表格显示的数据）"""
-        if not self.connected or not self.servo_manager:
+        if not self.connected:
             self.status_bar.showMessage("请先连接串口")
             return
 
@@ -1824,6 +1786,7 @@ class ServoControlGUI(QMainWindow):
                 json.dump(self.servo_offsets, f, ensure_ascii=False, indent=2)
 
             print(f"保存的零偏数据: {self.servo_offsets}")
+            self.apply_joint_config()
             self.status_bar.showMessage(f"已保存零偏: {len(self.servo_offsets)} 个舵机")
         except Exception as e:
             self.status_bar.showMessage(f"保存零偏失败: {str(e)}")
@@ -1846,6 +1809,7 @@ class ServoControlGUI(QMainWindow):
         self.progress_bar.setVisible(False)
         self.scan_btn.setEnabled(True)
         self.scan_info.setText(f"扫描完成 - 共 {len(found)} 个舵机")
+        self.apply_joint_config()
 
         # 填充舵机选择下拉框
         self.servo_select_combo.clear()
@@ -1885,7 +1849,7 @@ class ServoControlGUI(QMainWindow):
         if self.info_thread and self.info_thread.isRunning():
             return
 
-        self.info_thread = SyncMonitorThread(self.servo_manager, self.found_servos)
+        self.info_thread = SyncMonitorThread(self.arm, self.found_servos)
         self.info_thread.all_info_ready.connect(self.on_all_info_ready)
         self.info_thread.finished.connect(self.on_info_finished)
         self.info_thread.serial_error.connect(self.handle_serial_error)
@@ -1964,7 +1928,7 @@ class ServoControlGUI(QMainWindow):
         target_angle = self.target_angle_spin.value()
 
         try:
-            self.servo_manager.set_servo_angle(servo_id, target_angle, is_mturn=True)
+            self.arm.move_joint(servo_id, target_angle)
             self.status_bar.showMessage(
                 f"已设置舵机 {servo_id} 角度为 {target_angle}° (多圈模式)"
             )
@@ -1985,7 +1949,7 @@ class ServoControlGUI(QMainWindow):
         power = self.damping_power_spin.value()
 
         try:
-            self.servo_manager.set_damping(servo_id, power)
+            self.arm.set_damping(servo_id, power)
             self.status_bar.showMessage(f"已设置舵机 {servo_id} 阻尼功率为 {power}mW")
         except Exception as e:
             self.status_bar.showMessage(f"设置阻尼失败: {str(e)}")
@@ -2053,14 +2017,11 @@ class ServoControlGUI(QMainWindow):
                     self.servo_sliders[servo_id].setValue(int(offset_value))
 
                 # 发送控制指令到舵机
-                if self.connected and self.servo_manager:
-                    zero_offset = self.servo_offsets.get(servo_id, 0.0)
-                    target_angle = zero_offset + offset_value
+                if self.connected:
                     try:
-                        self.servo_manager.set_servo_angle(
+                        self.arm.move_joint(
                             servo_id,
-                            target_angle,
-                            is_mturn=True,
+                            offset_value,
                             velocity=self.servo_speed_spin.value(),
                         )
                     except Exception as e:
@@ -2070,7 +2031,7 @@ class ServoControlGUI(QMainWindow):
 
     def run_sequence(self):
         """开始执行顺序指令"""
-        if not self.connected or not self.servo_manager:
+        if not self.connected:
             self.status_bar.showMessage("请先连接串口")
             return
 
@@ -2144,35 +2105,13 @@ class ServoControlGUI(QMainWindow):
             "color: #007AFF; font-size: 13px; font-weight: 600;"
         )
 
-        # 准备同步指令数据
-        command_data_list = []
-        t_acc = 100  # 启动加速时间 (ms)
-        t_dec = 100  # 运动减速时间 (ms)
-        power = 10000  # 功率 (mW)
-
-        for servo_id, offset_angle in cmd["servo_data"].items():
-            zero_offset = self.servo_offsets.get(servo_id, 0.0)
-            target_angle = zero_offset + offset_angle
-            interval = int(cmd["run_time"] * 1000)
-
-            # 使用 struct.pack 打包数据，格式: '<BlLHHH'
-            packed_data = struct.pack(
-                "<BlLHHH",
-                servo_id,
-                int(target_angle * 10),  # 角度需要放大10倍
-                interval,
-                t_acc,
-                t_dec,
-                power,
-            )
-            command_data_list.append(packed_data)
-
-        # 发送同步指令
         try:
-            self.servo_manager.send_sync_multiturnanglebyinterval(
-                command_id=14,
-                servo_num=len(command_data_list),
-                command_data_list=command_data_list,
+            self.arm.move_joints(
+                cmd["servo_data"],
+                duration=cmd["run_time"],
+                acceleration_ms=100,
+                deceleration_ms=100,
+                power_mw=10000,
             )
         except Exception as e:
             print(f"发送同步指令失败: {e}")
@@ -2192,6 +2131,11 @@ class ServoControlGUI(QMainWindow):
         self.sequence_running = False
         if self.waiting_timer:
             self.waiting_timer.stop()
+        if self.connected:
+            try:
+                self.arm.stop()
+            except Exception as e:
+                self.status_bar.showMessage(f"停止机械臂失败: {e}")
         self.sequence_finished()
 
     def sequence_finished(self):
@@ -2543,31 +2487,18 @@ class ServoControlGUI(QMainWindow):
 
     def send_shortcut_sync_command(self, servo_id, target_offset):
         """发送快捷键同步控制命令"""
-        if not self.connected or not self.servo_manager:
+        if not self.connected:
             return
 
         try:
-            zero_offset = self.servo_offsets.get(servo_id, 0.0)
-            target_angle = zero_offset + target_offset
-
-            # 使用设置的周期作为命令总时间，加速减速时间为周期的四分之一
-            interval = self.shortcut_period  # 总时间 = 设置的周期
-            t_acc = max(20, interval // 4)  # 启动加速时间 = 周期的1/4，最小20ms
-            t_dec = max(20, interval // 4)  # 运动减速时间 = 周期的1/4，最小20ms
-            power = 15000  # 功率 (mW)
-
-            packed_data = struct.pack(
-                "<BlLHHH",
-                servo_id,
-                int(target_angle * 10),  # 角度需要放大10倍
-                interval,
-                t_acc,
-                t_dec,
-                power,
-            )
-
-            self.servo_manager.send_sync_multiturnanglebyinterval(
-                command_id=14, servo_num=1, command_data_list=[packed_data]
+            interval = self.shortcut_period
+            ramp = max(20, interval // 4)
+            self.arm.move_joints(
+                {servo_id: target_offset},
+                duration=interval / 1000.0,
+                acceleration_ms=ramp,
+                deceleration_ms=ramp,
+                power_mw=15000,
             )
 
             self.status_bar.showMessage(f"舵机 {servo_id}: {target_offset}°")
@@ -2877,8 +2808,8 @@ class ServoControlGUI(QMainWindow):
             if data["timer"]:
                 data["timer"].stop()
         self.slider_data.clear()
-        if self.uart and self.uart.is_open:
-            self.uart.close()
+        if self.arm.connected:
+            self.arm.disconnect()
         event.accept()
 
 

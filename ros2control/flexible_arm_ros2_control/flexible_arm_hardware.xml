@@ -1,0 +1,11 @@
+<?xml version="1.0"?>
+<library path="flexible_arm_ros2_control">
+  <class
+    name="flexible_arm_ros2_control/TopicSystem"
+    type="flexible_arm_ros2_control::TopicSystem"
+    base_class_type="hardware_interface::SystemInterface">
+    <description>
+      Position hardware interface bridged to the Python FlexibleArm SDK over JointState topics.
+    </description>
+  </class>
+</library>

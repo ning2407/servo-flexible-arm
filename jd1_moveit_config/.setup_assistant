@@ -1,0 +1,23 @@
+moveit_setup_assistant_config:
+  urdf:
+    package: jd1
+    relative_path: urdf/jd1.urdf
+  srdf:
+    relative_path: config/jd1.srdf
+  package_settings:
+    author_name: ning24
+    author_email: ningyongxu@softrobottech.com
+    generated_timestamp: 1785486182
+  control_xacro:
+    command:
+      - position
+    state:
+      - position
+  modified_urdf:
+    xacros:
+      - control_xacro
+  control_xacro:
+    command:
+      - position
+    state:
+      - position
