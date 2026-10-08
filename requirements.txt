@@ -1,4 +1,0 @@
-pyserial>=3.5
-fashionstar-uart-sdk>=1.0.0
-PyQt6>=6.0.0
-keyboard>=0.13.5
