@@ -1,0 +1,5 @@
+# motorapi / 上位机 运行环境
+# 核心运行库零第三方依赖（仅标准库 ctypes/tkinter）。
+# 以下为开发/辅助工具（可选安装）：
+pypdf>=4.0        # PDF 文档提取（协议手册/SDK手册分析）
+paramiko>=3.0     # 远程部署到 Linux VM（可选）

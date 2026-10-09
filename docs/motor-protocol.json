@@ -1,0 +1,437 @@
+{
+  "meta": {
+    "name": "25-30mm integrated drive motor CAN-FD protocol",
+    "source": "25-30mm驱控一体电机使用说明手册_20260921.pdf",
+    "version": "V20260921",
+    "pages": 19,
+    "language": "zh-CN",
+    "notes": [
+      "All multi-byte fields are little-endian (lowest data index holds LSB).",
+      "Signed fields use offset-binary encoding (raw - 0x8000 / raw - 0x80000000).",
+      "Verified against every example frame printed in the manual; see tools/motor_codec.py.",
+      "V20260921 verified on real hardware 2026-10-08: HCANFD Pro-II analyser + 25mm motor, status frames ~51/s, MIT request/reply confirmed."
+    ]
+  },
+  "bus": {
+    "type": "ISO CAN FD",
+    "frame_format": "standard 11-bit",
+    "arbitration_bitrate": 1000000,
+    "arbitration_sample_point_percent": 80,
+    "data_bitrate": 4000000,
+    "data_sample_point_percent": 80,
+    "termination_ohm": 120,
+    "termination_note": "one 120 ohm resistor at each end of the bus"
+  },
+  "power": {
+    "nominal_v": 12,
+    "range_v": [
+      10,
+      18
+    ],
+    "overvoltage_fault_v": 18,
+    "undervoltage_fault_v": 8,
+    "wires": [
+      {
+        "color": "red",
+        "function": "V+"
+      },
+      {
+        "color": "black",
+        "function": "V-"
+      },
+      {
+        "color": "blue",
+        "function": "CANH"
+      },
+      {
+        "color": "white",
+        "function": "CANL"
+      }
+    ]
+  },
+  "node": {
+    "id_symbol": "N",
+    "range": [
+      1,
+      60
+    ],
+    "default": 1,
+    "id_change": "V20260921 sec 3.8: broadcast frame 0x4FE, 8 bytes [N,0x20,0x26,0x05,0x20,0x10,0x58,0x00]; only one controller may be on the bus when writing; power cycle required; range conflict 1..64 (sec 3.8) vs 1..60 (sec 3.1) - use 1..60"
+  },
+  "frames": [
+    {
+      "name": "mit_send",
+      "description": "MIT-mode command / target frame; reused by speed & position modes",
+      "direction": "host_to_motor",
+      "id": "0x501 + 4*N",
+      "dlc": 12,
+      "fields": [
+        {
+          "offset": 0,
+          "length": 4,
+          "name": "position_code",
+          "type": "s32 offset-binary LE",
+          "scale_to_deg": "code / 2097152 * 360",
+          "range": [
+            -2097151999,
+            2097151999
+          ],
+          "range_hex": "±0x07CFFFFFF",
+          "note": "21-bit encoder, 2097152 counts/turn, multi-turn, ≈±1000 turns"
+        },
+        {
+          "offset": 4,
+          "length": 2,
+          "name": "velocity_code",
+          "type": "s16 offset-binary LE",
+          "scale_to_rpm": "code / 10",
+          "range": [
+            -30000,
+            30000
+          ]
+        },
+        {
+          "offset": 6,
+          "length": 2,
+          "name": "kp",
+          "type": "u16 LE",
+          "scale": 1e-05,
+          "range": [
+            0,
+            0.65535
+          ],
+          "recommended": 0.008,
+          "physical": "protocol_kp = kact[A/rad] * 0.001115"
+        },
+        {
+          "offset": 8,
+          "length": 2,
+          "name": "kd",
+          "type": "u16 LE",
+          "scale": 0.01,
+          "range": [
+            0,
+            655.35
+          ],
+          "recommended": 1.0,
+          "physical": "protocol_kd = kact[A/(rad/s)] * 85.636"
+        },
+        {
+          "offset": 10,
+          "length": 2,
+          "name": "feedforward_current_code",
+          "type": "s16 offset-binary LE",
+          "scale_to_amp": "code * 11 / 4096"
+        }
+      ],
+      "mode_note": "kp/kd/feedforward only take effect in MIT mode; other modes use firmware-fixed gains"
+    },
+    {
+      "name": "mit_reply",
+      "direction": "motor_to_host",
+      "id": "0x701 + 4*N",
+      "dlc": 12,
+      "trigger": "one reply per received mit_send frame",
+      "fields": [
+        {
+          "offset": 0,
+          "length": 2,
+          "name": "id_echo",
+          "type": "u16 LE",
+          "value": "data0 = 0x01+4*N, data1 = 0x05 (V20260921)"
+        },
+        {
+          "offset": 2,
+          "length": 4,
+          "name": "position_code",
+          "type": "s32 offset-binary LE"
+        },
+        {
+          "offset": 6,
+          "length": 2,
+          "name": "velocity_code",
+          "type": "s16 offset-binary LE"
+        },
+        {
+          "offset": 8,
+          "length": 2,
+          "name": "current_code",
+          "type": "s16 offset-binary LE",
+          "scale_to_amp": "code * 11 / 4096"
+        },
+        {
+          "offset": 10,
+          "length": 2,
+          "name": "reserved",
+          "value": "0x0000"
+        }
+      ]
+    },
+    {
+      "name": "motor_status",
+      "direction": "motor_to_host",
+      "id": "0x702 + 4*N",
+      "dlc": 20,
+      "period_ms": 20,
+      "fields": [
+        {
+          "offset": 0,
+          "length": 2,
+          "name": "id_echo",
+          "type": "u16 LE",
+          "value": "data0 = 0x01+4*N, data1 = 0x05 (V20260921)"
+        },
+        {
+          "offset": 2,
+          "length": 4,
+          "name": "position_code",
+          "type": "s32 offset-binary LE"
+        },
+        {
+          "offset": 6,
+          "length": 2,
+          "name": "velocity_code",
+          "type": "s16 offset-binary LE"
+        },
+        {
+          "offset": 8,
+          "length": 2,
+          "name": "current_code",
+          "type": "s16 offset-binary LE",
+          "scale_to_amp": "code * 11 / 4096"
+        },
+        {
+          "offset": 10,
+          "length": 2,
+          "name": "bus_voltage_code",
+          "type": "u16 LE",
+          "scale_to_volt": "code / 10",
+          "note": "unsigned; manual formula typo: data1 should be data10; verified 12.6-12.7V on bench"
+        },
+        {
+          "offset": 12,
+          "length": 4,
+          "name": "fault",
+          "type": "u32 LE",
+          "bits": {
+            "0": "driver_chip_fault",
+            "1": "overvoltage_gt_18V",
+            "2": "undervoltage_lt_8V",
+            "3": "overcurrent_10s_power",
+            "4": "encoder_fault"
+          }
+        },
+        {
+          "offset": 16,
+          "length": 1,
+          "name": "motor_state",
+          "type": "enum u8",
+          "values": {
+            "0": "init",
+            "1": "current_calibration",
+            "2": "encoder_zero_calibration",
+            "3": "stopped",
+            "4": "running",
+            "5": "error"
+          }
+        },
+        {
+          "offset": 17,
+          "length": 1,
+          "name": "encoder_calibration_state",
+          "type": "enum u8",
+          "values": {
+            "0": "idle",
+            "1": "calibrating",
+            "2": "done",
+            "3": "error"
+          }
+        },
+        {
+          "offset": 18,
+          "length": 1,
+          "name": "mode",
+          "type": "enum u8",
+          "values": {
+            "0": "MIT",
+            "1": "speed",
+            "2": "position"
+          }
+        },
+        {
+          "offset": 19,
+          "length": 1,
+          "name": "motor_type",
+          "type": "enum u8",
+          "values": {
+            "1": "30mm",
+            "2": "25mm",
+            "3": "20mm",
+            "4": "16mm"
+          }
+        }
+      ]
+    },
+    {
+      "name": "motor_control",
+      "direction": "host_to_motor",
+      "id": "0x502 + 4*N",
+      "dlc": 8,
+      "fields": [
+        {
+          "offset": 0,
+          "length": 1,
+          "name": "run_stop",
+          "type": "enum u8",
+          "values": {
+            "0": "stop",
+            "1": "run"
+          },
+          "note": "MIT mode requires run before control"
+        },
+        {
+          "offset": 1,
+          "length": 1,
+          "name": "set_zero",
+          "type": "enum u8",
+          "values": {
+            "1": "set current position as zero (affects position control)"
+          },
+          "note": "other values: no effect"
+        },
+        {
+          "offset": 2,
+          "length": 1,
+          "name": "mode",
+          "type": "enum u8",
+          "values": {
+            "0": "MIT",
+            "1": "speed",
+            "2": "position"
+          },
+          "note": "mode change only takes effect while stopped (data0=0x00)"
+        },
+        {
+          "offset": 3,
+          "length": 5,
+          "name": "reserved",
+          "value": "0x00"
+        }
+      ]
+    },
+    {
+      "name": "encoder_zero_calibration",
+      "direction": "host_to_motor",
+      "id": "0x503 + 4*N",
+      "dlc": 8,
+      "payload": "55 AA CC 33 77 11 FF 00 (fixed key)",
+      "procedure": "send stop+MIT (0005) first, then this key; rotation takes ~10s, do not power off; check status data17 or result frame"
+    },
+    {
+      "name": "calibration_result",
+      "direction": "motor_to_host",
+      "id": "0x703 + 4*N",
+      "dlc": 8,
+      "fields": [
+        {
+          "offset": 0,
+          "length": 1,
+          "name": "result",
+          "type": "enum u8",
+          "values": {
+            "2": "done",
+            "3": "error"
+          }
+        },
+        {
+          "offset": 1,
+          "length": 7,
+          "name": "reserved",
+          "value": "0x00"
+        }
+      ]
+    },
+    {
+      "name": "set_node_id",
+      "description": "broadcast command to set controller number N (V20260921 sec 3.8)",
+      "direction": "host_to_motor",
+      "id": "0x4FE (global broadcast, independent of current N)",
+      "dlc": 8,
+      "warning": "exactly one controller must be on the bus; power cycle to take effect; all CAN IDs change to the new N",
+      "fields": [
+        {
+          "offset": 0,
+          "length": 1,
+          "name": "new_node_id",
+          "type": "u8",
+          "range": [
+            1,
+            64
+          ],
+          "note": "networking limit is 60 (sec 3.1)"
+        },
+        {
+          "offset": 1,
+          "length": 7,
+          "name": "fixed_key",
+          "value": "20 26 05 20 10 58 00"
+        }
+      ]
+    }
+  ],
+  "modes": {
+    "power_on_default": "MIT",
+    "switch_rule": "must be stopped (control data0=0x00) before changing control data2",
+    "speed_mode_uses": "velocity field of mit_send frame",
+    "position_mode_uses": "position field of mit_send frame (velocity field inferred as travel speed)"
+  },
+  "current_loop_bandwidth_hz": 1000,
+  "example_frames": [
+    {
+      "frame": "010001800080200364000080",
+      "location": "page 2, position-mode parameters",
+      "decoded": {
+        "position_code": 65537,
+        "velocity_rpm": 0,
+        "kp": 0.008,
+        "kd": 1.0,
+        "feedforward_current_a": 0.0
+      }
+    },
+    {
+      "frame": "010001800080000000006480",
+      "location": "page 3, current mode",
+      "decoded": {
+        "position_code": 65537,
+        "velocity_rpm": 0,
+        "kp": 0.0,
+        "kd": 0.0,
+        "feedforward_current_a": 0.2685546875
+      }
+    },
+    {
+      "frame": "010000900080200364000080",
+      "location": "page 6, command 0001",
+      "decoded": {
+        "position_code": 268435457,
+        "velocity_rpm": 0,
+        "kp": 0.008,
+        "kd": 1.0,
+        "feedforward_current_a": 0.0
+      }
+    }
+  ],
+  "open_questions": [
+    "payload format of calibration command 0x503+4N",
+    "fault recovery / reset procedure",
+    "exact meaning of velocity field in position mode",
+    "motor constants: torque constant, rated/peak current, pole pairs, limits",
+    "whether the 8-byte control frame may be sent as classic CAN (no BRS)"
+  ],
+  "encoder": {
+    "resolution_bits": 21,
+    "type": "single-turn absolute magnetic (motor side, before gearbox)",
+    "counts_per_turn": 2097152,
+    "multi_turn": "software tracked, LOST on power off; use mechanical home after power-up"
+  }
+}

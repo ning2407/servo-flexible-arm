@@ -1,0 +1,21 @@
+# ---- 虚拟环境 / Python ----
+.venv/
+.venv*/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# ---- 厂商原始资料（440MB，不入库；Linux驱动库已提取到 vendor/hcanbus/linux/）----
+can资料/
+
+# ---- 文档中间提取产物（PDF原文与知识库为准）----
+docs/**/_*_extract.txt
+
+# ---- IDE / 系统 ----
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+
+# 例外：必须随仓库分发的厂商驱动 DLL（全局ignore含*.dll，需 -f 强制添加）
+!vendor/hcanbus/x64/HCanbus.dll
