@@ -1,6 +1,6 @@
 # motorapi —— 25-30mm 驱控一体电机控制库（API 文档）
 
-> 版本：1.0.0 · 协议依据：《25-30mm驱控一体电机使用说明手册》V20260921
+> 版本：1.1.0 · 协议依据：《25-30mm驱控一体电机使用说明手册》V20260921
 > 适配器：HCANFD Pro-II 双通道 USB-CAN-FD（四川禾华盛）
 > 平台：Windows 10/11（x64）· Linux x86_64（Ubuntu 20.04 实测）/ arm64（库已提供未实测）
 > 依赖：**零第三方依赖**（仅 Python 标准库 ctypes/tkinter 等）
@@ -10,6 +10,9 @@
 ## 1. 概述与架构
 
 `motorapi` 是 25-30mm 驱控一体电机的完整控制库，分三层：
+
+单电机使用 `MotorApi`；多电机同通道由 `MotorNetwork` 管理连接和接收，
+各节点仍通过 `MotorApi` 操作（见 §3.3）。
 
 ```
 ┌─────────────────────────────────────────────────────┐
@@ -119,6 +122,47 @@ with MotorApi(MotorConfig(node=3, gear_ratio=50)) as api:
 
 ---
 
+### 3.3 多电机共享通道：MotorNetwork
+
+三台电机共用一个 HCANFD 通道时，用 `MotorNetwork` 注册三个 `MotorApi`。
+网络只打开一次通道，以一个接收线程按节点分发反馈；每个电机仍使用上文
+的高层方法，不需要应用程序编码 CAN 帧。
+
+```python
+from motorapi import MotorNetwork, MotorConfig
+
+network = MotorNetwork(channel=0)
+# 编号、减速比仅为示例，须替换成实测值。
+motors = [network.motor(MotorConfig(channel=0, node=n, gear_ratio=50))
+          for n in (1, 2, 3)]
+try:
+    network.connect()
+    for motor in motors:
+        st = motor.wait_status()
+        print(motor.node, st.position_out_deg, st.fault_code)
+finally:
+    network.disconnect()  # 尝试停止每台电机，再关闭唯一通道
+```
+
+需要运动时，对返回的电机调用 `set_mode(MODE_MIT)`、`send_mit(...)`、
+`run_enable()`、`stop_motor()` 等方法。`send_mit` 输入仍为输出端角度/转速，
+减速比换算在 API 内完成。ROS 控制器可以在自己的轨迹循环中调用它，
+无需同时启动 API 的 `start_trajectory` 或 `start_mit_streaming`。
+
+节点必须唯一，通道参数必须一致；连接前完成注册。网络连接/断开由同一
+管理线程负责。单个电机 `disconnect()` 只停止并停用自身，不关闭其他电机
+的通道；`connect()` 可重新接入现有网络。最终由 `network.disconnect()` 关闭通道。
+只读监控程序可用 `network.disconnect(stop_motors=False)` 退出，不向电机发送停止帧。
+回调共用接收线程，必须快速返回，耗时工作应转交队列。共享网络禁止
+`set_node` 和广播 `set_node_id`；改号请退出共享控制并单台接线后使用独立 API。
+
+新增状态字段 `fault_code`、`motor_state_raw`、`mode_raw` 保留完整故障与枚举值。
+`get_status()` 遇到接收错误会抛出 `MotorApiError`；反馈新鲜度仍应通过
+`timestamp` 检查，`wait_status()` 不接受超过 0.5 秒的旧反馈。
+`output_position_limit_deg` 返回输出端协议位置上限。
+发送未成功发出一帧时抛出 `MotorApiError`，接收异常后仍允许尝试停止电机。
+独立单电机 `MotorApi(MotorConfig(...))` 的用法保持兼容。
+
 ## 4. 配置参考：MotorConfig
 
 | 字段 | 类型 | 默认 | 说明 |
@@ -158,6 +202,8 @@ api.set_node(3)
 | `current_a` | A | 相电流 |
 | `bus_voltage_v` | V | 母线电压（10~18V 正常，<8 或 >18 会报故障） |
 | `faults` | list[str] | 故障名列表（空=无故障），见 §10.2 |
+| `fault_code` | int | 完整故障位图，包含尚未命名的位 |
+| `motor_state_raw` / `mode_raw` | int | 原始电机状态 / 模式枚举 |
 | `motor_state` | str | 初始化/电流校准/编码器零点校准/停止/运行/错误 |
 | `calib_state` | str | 空闲/校准/完成/错误 |
 | `mode` | str | MIT模式/速度模式/位置模式 |
@@ -384,6 +430,7 @@ bus.close()
 | 版本 | 日期 | 变更 |
 |---|---|---|
 | 1.0.0 | 2026-10-09 | 首版：全 API、跨平台、实测验证（Windows/Linux 台架） |
+| 1.1.0 | 2026-10-09 | MotorNetwork 多节点共享通道；完整故障码及状态枚举；发送失败和接收错误上报。共享网络已通过模拟测试，尚未实机联调 |
 
 ---
 
@@ -391,7 +438,7 @@ bus.close()
 
 | 文件 | 说明 |
 |---|---|
-| `motorapi/` | 库源码（transport.py / codec.py / motor.py / __init__.py） |
+| `motorapi/` | 库源码（transport.py / codec.py / motor.py / network.py / __init__.py） |
 | `docs/api.md` | 本文档 |
 | `docs/motor-canfd-knowledge-base.md` | 协议知识库（背景与实测结论） |
 | `docs/motor-protocol.json` | 协议机器可读规格 |

@@ -55,6 +55,8 @@ api = MotorApi(MotorConfig(channel=0, node=1, gear_ratio=50))
 api.connect(); api.run_speed(30); api.stop_motor(); api.disconnect()
 ```
 **交付同事：`docs/api.md`（详细 API 文档）+ `motorapi/` + `examples/`。**
+多电机同通道控制使用 `MotorNetwork`（API 1.1.0）：一个通道、一个接收线程，
+为各节点提供高层 `MotorApi`。用法见 `docs/api.md` §3.3；独立单电机用法兼容。
 协议背景与全部实测结论见 `docs/motor-canfd-knowledge-base.md`（§14-17：适配器SDK差异/实测汇总/架构/台架状态）。
 
 ## 目录结构

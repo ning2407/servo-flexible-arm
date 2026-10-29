@@ -73,6 +73,9 @@ class MotorStatus:
     calib_state: str = ""
     mode: str = ""
     motor_type: str = ""
+    fault_code: int = 0
+    motor_state_raw: int = 0
+    mode_raw: int = 0
 
 
 @dataclass
@@ -92,9 +95,12 @@ class MotorApi:
 
     MOTOR_RPM_MAX = 3000.0   # 协议电机端速度上限
 
-    def __init__(self, config: Optional[MotorConfig] = None):
+    def __init__(self, config: Optional[MotorConfig] = None, *, network=None):
         self.cfg = config or MotorConfig()
-        self.bus = HCanbus()
+        self._network = network
+        self.bus = network.bus if network is not None else HCanbus()
+        self._receive_error = None
+        self._last_calib = None
         self._connected = False
         self._rx_thread: Optional[threading.Thread] = None
         self._rx_stop = threading.Event()
@@ -129,6 +135,11 @@ class MotorApi:
     def gear_ratio(self) -> float:
         return self.cfg.gear_ratio
 
+    @property
+    def output_position_limit_deg(self) -> float:
+        """Symmetric protocol position limit, in output-end degrees."""
+        return POS_CODE_MAX * 360.0 / 2097152.0 / self.cfg.gear_ratio
+
     def set_gear_ratio(self, r: float) -> None:
         if r <= 0:
             raise ValueError("gear_ratio must be > 0")
@@ -138,6 +149,8 @@ class MotorApi:
         """切换目标电机编号 N（1..60），ID 立即按新 N 计算。"""
         if not 1 <= n <= 60:
             raise ValueError("node must be 1..60")
+        if self._network is not None:
+            raise MotorApiError("shared-network node is fixed; create a new network for node changes")
         self.cfg.node = int(n)
 
     # ------------------------------------------------------------ 回调
@@ -177,6 +190,15 @@ class MotorApi:
         """打开通道并按电机要求初始化（ISO CAN FD 1M/4M@80%）。返回实际时序。"""
         if self._connected:
             raise MotorApiError("already connected")
+        if self._network is not None:
+            if channel is not None and channel != self._network.channel:
+                raise MotorApiError("shared network owns the channel")
+            timing = self._network.connect()
+            if not self._connected:
+                self._latest_status = None
+                self._connected = True
+            return timing
+        self._receive_error = None
         ch = self.cfg.channel if channel is None else channel
         self.bus.open(ch)
         cfg = self.bus.canfd_init(self.cfg.nom_baud, self.cfg.dat_baud,
@@ -192,6 +214,9 @@ class MotorApi:
     def disconnect(self) -> None:
         self.abort_trajectory()
         self.stop_mit_streaming()
+        if self._network is not None:
+            self._connected = False
+            return
         self._rx_stop.set()
         if self._rx_thread:
             self._rx_thread.join(timeout=2.0)
@@ -203,39 +228,48 @@ class MotorApi:
         self._connected = False
 
     def _rx_loop(self) -> None:
-        ids = can_ids(self.cfg.node)
-        base = 0x701 + 4 * self.cfg.node
-        last_calib = None
         while not self._rx_stop.is_set():
             try:
-                frames = self.bus.recv_fd(max_items=200, timeout_ms=100)
-            except Exception:
+                # RX and TX share the SDK lock: keep blocking reads short.
+                frames = self.bus.recv_fd(max_items=200, timeout_ms=1)
+            except Exception as exc:
+                self._receive_error = str(exc)
                 return
-            for f in frames:
+            for frame in frames:
+                self._handle_frame(frame)
+            # Yield outside the transport lock so pending TX can proceed.
+            self._rx_stop.wait(0.001)
+
+    def _handle_frame(self, f) -> None:
+        """Shared dispatch used by both single-motor and network receivers."""
+        base = 0x701 + 4 * self.cfg.node
+        def callback(cb, *args):
+            if cb:
                 try:
-                    if self._on_frame:
-                        self._on_frame(f.id, f.data, f.timestamp_us, f.frame_type)
-                    if f.id == base + 1 and len(f.data) == 20:
-                        st = self._decode_status(f.data)
-                        self._latest_status = st
-                        if self._on_status:
-                            self._on_status(st)
-                        if st.calib_state != last_calib:
-                            last_calib = st.calib_state
-                            if self._on_calib and st.calib_state in ("完成", "错误"):
-                                self._on_calib({"state": st.calib_state,
-                                                "ok": st.calib_state == "完成"})
-                    elif f.id == base and len(f.data) == 12:
-                        d = decode_reply(f.data, n=self.cfg.node)
-                        self._latest_reply = d
-                        if self._on_reply:
-                            self._on_reply(d)
-                    elif f.id == base + 2 and len(f.data) == 8:
-                        d = decode_calibration_result(f.data)
-                        if self._on_calib:
-                            self._on_calib(d)
+                    cb(*args)
                 except Exception:
-                    continue
+                    pass
+        callback(self._on_frame, f.id, f.data, f.timestamp_us, f.frame_type)
+        if f.id == base + 1 and len(f.data) == 20:
+            decoded = decode_status(f.data, n=self.cfg.node)
+            if decoded["id_echo"] != decoded["expected_id_echo"]:
+                return
+            st = self._decode_status(f.data)
+            with self._lock:
+                self._latest_status = st
+            callback(self._on_status, st)
+            if st.calib_state != self._last_calib:
+                self._last_calib = st.calib_state
+                if st.calib_state in ("完成", "错误"):
+                    callback(self._on_calib, {"state": st.calib_state,
+                                             "ok": st.calib_state == "完成"})
+        elif f.id == base and len(f.data) == 12:
+            d = decode_reply(f.data, n=self.cfg.node)
+            with self._lock:
+                self._latest_reply = d
+            callback(self._on_reply, d)
+        elif f.id == base + 2 and len(f.data) == 8:
+            callback(self._on_calib, decode_calibration_result(f.data))
 
     def _decode_status(self, data: bytes) -> MotorStatus:
         d = decode_status(data, n=self.cfg.node)
@@ -252,7 +286,9 @@ class MotorApi:
             bus_voltage_v=d["bus_voltage_v"],
             faults=list(d["faults"]),
             motor_state=d["motor_state"], calib_state=d["calib_state"],
-            mode=d["mode"], motor_type=d["motor_type"])
+            mode=d["mode"], motor_type=d["motor_type"],
+            fault_code=int(d["fault_raw"], 16),
+            motor_state_raw=d["motor_state_raw"], mode_raw=d["mode_raw"])
 
     # ------------------------------------------------------------ 状态
     def get_status(self, timeout: float = 0.3,
@@ -261,6 +297,8 @@ class MotorApi:
         deadline = time.monotonic() + timeout
         while True:
             with self._lock:
+                if self._receive_error:
+                    raise MotorApiError("CAN receive failed: " + self._receive_error)
                 st = self._latest_status
             if st is not None:
                 if max_age is None or time.monotonic() - st.timestamp <= max_age:
@@ -271,7 +309,7 @@ class MotorApi:
 
     def wait_status(self, timeout: float = 2.0) -> MotorStatus:
         st = self.get_status(timeout=timeout, max_age=0.5)
-        if st is None:
+        if st is None or time.monotonic() - st.timestamp > 0.5:
             raise MotorApiError("timeout waiting motor status (check power/bus)")
         return st
 
@@ -282,7 +320,8 @@ class MotorApi:
     def _tx(self, can_id: int, data: bytes, note: str = "") -> None:
         if not self._connected:
             raise MotorApiError("not connected")
-        self.bus.send_fd(can_id, data)
+        if self.bus.send_fd(can_id, data) != 1:
+            raise MotorApiError("CAN transmit did not send one frame")
         if self._on_tx:
             try:
                 self._on_tx(can_id, data)
@@ -332,7 +371,6 @@ class MotorApi:
 
         None 表示沿用默认/零值；返回发送的原始帧。
         """
-        st = self.get_status()
         pos_out = position_out_deg if position_out_deg is not None else 0.0
         vel_out = velocity_out_rpm if velocity_out_rpm is not None else 0.0
         data = encode_mit_frame(
@@ -396,8 +434,8 @@ class MotorApi:
 
     def _stream_loop(self) -> None:
         period = 1.0 / max(10.0, min(500.0, self._stream_hz))
+        deadline = time.monotonic()
         while not self._stream_stop.is_set():
-            t0 = time.monotonic()
             with self._lock:
                 p = dict(self._stream_params) if self._stream_params else None
             if p:
@@ -405,9 +443,16 @@ class MotorApi:
                     self.send_mit(p["pos"], p["vel"], p["kp"], p["kd"], p["ff"])
                 except Exception:
                     return
-            dt = period - (time.monotonic() - t0)
-            if dt > 0:
-                self._stream_stop.wait(dt)
+            deadline = self._next_send_deadline(deadline, period, time.monotonic())
+            self._stream_stop.wait(max(0.0, deadline - time.monotonic()))
+
+    @staticmethod
+    def _next_send_deadline(deadline: float, period: float, now: float) -> float:
+        """Keep the original cadence, skipping missed slots instead of bursting."""
+        deadline += period
+        if deadline < now:
+            deadline += (int((now - deadline) / period) + 1) * period
+        return deadline
 
     # ------------------------------------------------------------ 速度/位置模式
     def run_speed(self, rpm_out: float) -> None:
@@ -495,6 +540,7 @@ class MotorApi:
             self.run_enable()
             time.sleep(0.03)
             t0 = time.monotonic()
+            deadline = t0
             while not self._traj_abort.is_set():
                 t = time.monotonic() - t0
                 if t >= plan["total"]:
@@ -514,7 +560,8 @@ class MotorApi:
                 if t >= plan["total"]:
                     ts.running, ts.done = False, True
                     break
-                time.sleep(0.01)
+                deadline = self._next_send_deadline(deadline, 0.01, time.monotonic())
+                self._traj_abort.wait(max(0.0, deadline - time.monotonic()))
             else:
                 self.traj_state.aborted = True
             self.traj_state.running = False
@@ -593,6 +640,8 @@ class MotorApi:
     def set_node_id(self, new_n: int) -> tuple:
         """写电机编号（0x4FE 广播）。⚠ 必须单台在线；断电重启生效。
         返回 (can_id, data)。"""
+        if self._network is not None:
+            raise MotorApiError("node ID broadcast is not allowed on a shared network")
         can_id, data = encode_set_node_id(new_n)
         self._tx(can_id, data)
         return can_id, data

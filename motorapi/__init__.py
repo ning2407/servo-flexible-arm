@@ -20,11 +20,12 @@ from .transport import (HCanbus, FDFrame, calc_bit_timing,
                         FMT_CANFD, FMT_FDBRS, FMT_ECHO)
 from .motor import (MotorApi, MotorApiError, MotorConfig, MotorStatus,
                     TrajectoryState)
+from .network import MotorNetwork
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 __all__ = [
-    "MotorApi", "MotorApiError", "MotorConfig", "MotorStatus",
+    "MotorApi", "MotorApiError", "MotorConfig", "MotorStatus", "MotorNetwork",
     "TrajectoryState", "HCanbus", "FDFrame", "calc_bit_timing",
     "MODE_NORMAL", "MODE_LOOPBACK", "MODE_SILENT",
     "FMT_CANFD", "FMT_FDBRS", "FMT_ECHO",
